@@ -1,0 +1,761 @@
+---
+title: "Data Modelling V42 (New time and wind variables + weight for XGB (removed 2021-04-27 2 GStreet))"
+author: "Jerry Wu"
+date: "2026-01-12"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+abstract: ''
+subtitle: ''
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      message = FALSE,
+                      warning = FALSE)
+library(tidyverse)
+library(mgcv)
+library(mgcViz)
+library(leaps)
+library(kableExtra)
+library(gginnards)
+library(caret)
+select <- dplyr::select
+```
+
+# Load in data {.tabset .tabset-pills}
+## Full data
+```{r}
+hourly_full <- readRDS('../../data/hourly.rds')
+daily_from_hour_avg_full <- readRDS('../../data/daily_from_hourly_avg.rds')
+```
+
+## Splitted data
+```{r}
+daily_ha_train <- readRDS('../../data/daily_ha_train.rds')
+daily_ha_test <- readRDS('../../data/daily_ha_test.rds')
+hourly_train <- readRDS('../../data/hourly_train.rds')
+hourly_test <- readRDS('../../data/hourly_test.rds')
+```
+
+```{r}
+# Rename columns for clarity, as it's already transformed.
+rename_dist <- c('inv_dist_ref_p2' = 'dist_ref',
+                 'inv_dist_dc_p2' = 'dist_dc',
+                 'inv_dist_wrp_p2' = 'dist_wrp')
+
+daily_ha_train <- daily_ha_train %>%
+  rename(rename_dist)
+daily_ha_test <- daily_ha_test %>%
+  rename(rename_dist)
+hourly_train <- hourly_train %>%
+  rename(rename_dist)
+hourly_test <- hourly_test %>%
+  rename(rename_dist)
+```
+
+## Add new variables
+```{r}
+deg2rad <- function(x) x * pi / 180
+
+make_features <- function(df,
+                          id_col = "Monitor",
+                          time_col = "timestamp",
+                          wd_col = 'wd_avg', 
+                          ws_col = 'ws_avg') {
+   
+    df2 <- df %>%
+      group_by(.data[[id_col]]) %>%
+      arrange(.data[[time_col]], .by_group = TRUE) %>%
+      mutate(
+        # time parts
+        hour   = hour(.data[[time_col]]),          # 0 to 23
+        month  = month(.data[[time_col]]),         # 1 to 12
+        julian = yday(.data[[time_col]]),          # 1 to 365/366
+  
+        # cyclic time (fourier)
+        hour_sin   = sin(2 * pi * hour / 24),
+        hour_cos   = cos(2 * pi * hour / 24),
+        weekday_sin = sin(2 * pi * weekday / 7),
+        weekday_cos = cos(2 * pi * weekday / 7),
+        month_sin  = sin(2 * pi * month / 12),
+        month_cos  = cos(2 * pi * month / 12),
+        julian_sin = sin(2 * pi * julian / 365.25),
+        julian_cos = cos(2 * pi * julian / 365.25),
+  
+        # wind transforms
+        wd_rad = deg2rad(.data[[wd_col]]),
+        wd_sin = sin(wd_rad),
+        wd_cos = cos(wd_rad)#,
+        # wind_u = .data[[wd_col]] * wd_cos,
+        # wind_v = .data[[ws_col]] * wd_sin
+      ) %>%
+      ungroup()
+
+  
+  df2 %>%
+      select(-wd_rad)  
+}
+
+# run them on training and test
+hourly_train <- hourly_train %>%
+  mutate(timestamp = as.POSIXct(dayhour, format = "%Y-%m-%d %H", tz = "America/Los_Angeles"))
+
+hourly_test <- hourly_test %>%
+  mutate(timestamp = as.POSIXct(dayhour, format = "%Y-%m-%d %H", tz = "America/Los_Angeles"))
+
+hourly_train <- make_features(hourly_train, id_col = "Monitor", time_col = "timestamp")
+hourly_test <- make_features(hourly_test, id_col = "Monitor", time_col = "timestamp")
+
+# Compute for daily average features 
+daily_ha_train <- make_features(daily_ha_train, id_col = "Monitor", time_col = "day", 
+                                wd_col = 'daily_wd', ws_col = 'daily_ws')
+daily_ha_test <- make_features(daily_ha_test, id_col = "Monitor", time_col = "day", 
+                               wd_col = 'daily_wd', ws_col = 'daily_ws')
+
+daily_ha_train <- daily_ha_train %>%
+  rename('daily_wd_sin' = 'wd_sin',
+         'daily_wd_cos' = 'wd_cos')
+
+daily_ha_test <- daily_ha_test %>%
+  rename('daily_wd_sin' = 'wd_sin',
+         'daily_wd_cos' = 'wd_cos')
+
+# Compute for daily max features
+daily_ha_train <- make_features(daily_ha_train, id_col = "Monitor", time_col = "day", 
+                                wd_col = 'hourly_wd', ws_col = 'hourly_ws')
+daily_ha_test <- make_features(daily_ha_test, id_col = "Monitor", time_col = "day", 
+                               wd_col = 'hourly_wd', ws_col = 'hourly_ws')
+
+daily_ha_train <- daily_ha_train %>%
+  rename('hourly_wd_sin' = 'wd_sin',
+         'hourly_wd_cos' = 'wd_cos')
+
+daily_ha_test <- daily_ha_test %>%
+  rename('hourly_wd_sin' = 'wd_sin',
+         'hourly_wd_cos' = 'wd_cos')
+```
+
+```{r}
+# Exclude Event stepwise
+hourly_excl_dis_train <- hourly_train %>% 
+  filter(!(year == '2021' & month %in% c('10', '11', '12')))
+daily_ha_excl_dis_train <- daily_ha_train %>% 
+  filter(!(year == '2021' & month %in% c('10', '11', '12')))
+
+hourly_excl_dis_test<- hourly_test %>% 
+  filter(!(year == '2021' & month %in% c('10', '11', '12')))
+daily_ha_excl_dis_test <- daily_ha_test %>% 
+  filter(!(year == '2021' & month %in% c('10', '11', '12')))
+
+# Everything w.o disaster indicator
+hourly_full_train <- hourly_train %>%
+  select(-disaster)
+daily_ha_full_train <- daily_ha_train %>%
+  select(-disaster)
+
+hourly_full_test <- hourly_test %>%
+  select(-disaster)
+daily_ha_full_test <- daily_ha_test %>%
+  select(-disaster)
+```
+
+# GAM {.tabset .tabset-pills}
+## Feature Selection with training {.tabset .tabset-pills}
+### Select smooth
+```{r}
+# Select the best smooth predictors based on GCV
+daily_from_hour_avg_responses <- c('H2S_daily_avg_from_hourly_avg', 
+                                   'log(H2S_daily_avg_from_hourly_avg)',
+                                   'H2S_daily_max_from_hourly_avg', 
+                                   'log(H2S_daily_max_from_hourly_avg)')
+hourly_responses <- c('H2S_hourly_avg', 'log(H2S_hourly_avg)')
+
+dateranges <- c('excl_dis', 'full')
+
+smooth <- c("s(as.numeric(month),bs='cc')",
+            "s(I(mon_utm_x/10^3), I(mon_utm_y/10^3), bs='tp', k = 10)",
+            "te(I(mon_utm_x/10^3), I(mon_utm_y/10^3), as.numeric(day), k=c(10,10),d=c(2,1),bs=c('tp','cc'))")
+
+smooth_tibble <- tibble(features = c(list(c(smooth[1])),
+                                     list(c(smooth[2])),
+                                     list(c(smooth[3])),
+                                     list(c(smooth[1:2])),
+                                     list(c(smooth[c(1, 3)])),
+                                     list(c(smooth[2:3])),
+                                     list(c(smooth[1:3]))),
+                        disaster_applicable = c(0, 1, 1, 0, 0, 1, 0))
+
+smooth_compare <- crossing(response = c(daily_from_hour_avg_responses,
+                                        hourly_responses),
+                           daterange = dateranges) %>%
+  cross_join(smooth_tibble) %>%
+  mutate(GCV = NA) %>%
+  filter(!(daterange == 'dis' & disaster_applicable == 0)) %>%
+  select(-disaster_applicable)
+
+for (i in 1:nrow(smooth_compare)) {
+  features <- unname(unlist(smooth_compare[i,'features']))
+  formula_feature_str <- paste(features, collapse = ' + ')
+  formula_str <- paste(smooth_compare[[i, 'response']], formula_feature_str, sep = ' ~ ')
+  formula <- as.formula(formula_str)
+
+  # Assign dataset
+  if (smooth_compare[[i, 'response']] %in% hourly_responses) {
+    if (smooth_compare[[i, 'daterange']] == 'full') {
+      data <- hourly_full_train
+    } else {
+      data <- get(paste0('hourly_', smooth_compare[[i, 'daterange']], '_train'))
+    }
+  } else if (smooth_compare[[i, 'response']] %in% daily_from_hour_avg_responses) {
+    if (smooth_compare[[i, 'daterange']] == 'full') {
+      data <- daily_ha_full_train
+    } else {
+      data <- get(paste0('daily_ha_', smooth_compare[[i, 'daterange']], '_train'))
+    }
+  }
+
+  summary <- summary(gam(formula, data = data, method = 'GCV.Cp', select = TRUE))
+  GCV_new <- summary$sp.criterion[[1]]
+  smooth_compare[i, 'GCV'] <- GCV_new
+  print(str_glue('Completed {i} iterations'))
+  gc()
+}
+
+smooth_compare <- smooth_compare %>%
+  group_by(response, daterange) %>%
+  mutate(best = if_else(GCV == min(GCV), 1, 0)) %>%
+  mutate(rounded_GCV = round(GCV, 2)) %>%
+  rowwise() %>%
+  mutate(month_smooth = if_else(smooth[1] %in% unlist(features), 1, 0),
+         coord_smooth = if_else(smooth[2] %in% unlist(features), 1, 0),
+         coord_day_3D_smooth = if_else(smooth[3] %in% unlist(features), 1, 0)) %>%
+  ungroup()
+```
+
+### Fit smooth and get Residuals
+```{r}
+response_names <- c('daha', 'log_daha', 'dmha', 'log_dmha', 'ha', 'log_ha')
+
+smooth_models <- tibble(name = response_names,
+                        response = c(daily_from_hour_avg_responses,
+                                     hourly_responses)) %>%
+  crossing(tibble(daterange = dateranges)) %>%
+  mutate(name = paste(name, daterange, sep = '_'))
+
+
+smooth_predictors <-
+  c("s(as.numeric(month),bs='cc')",
+    "s(I(mon_utm_x/10^3), I(mon_utm_y/10^3), bs='tp', k = 10)",
+    "te(I(mon_utm_x/10^3), I(mon_utm_y/10^3), as.numeric(day), k=c(10,10),d=c(2,1),bs=c('tp','cc'))")
+
+smooth_models$residuals <- rep(list(c()), nrow(smooth_models))
+
+for (i in 1:nrow(smooth_models)) {
+  # first, get residuals of smooth on response
+  if (smooth_models$daterange[i] == 'dis') {
+    formula_feature_str <- paste(smooth_predictors[c(2, 3)], collapse = ' + ')
+  } else {
+    formula_feature_str <- paste(smooth_predictors, collapse = ' + ')
+  }
+
+  # Assign dataset
+  if (smooth_models[[i, 'response']] %in% hourly_responses) {
+    if (smooth_models[[i, 'daterange']] == 'full') {
+      data <- hourly_full_train
+    } else {
+      data <- get(paste0('hourly_', smooth_models[[i, 'daterange']], '_train'))
+    }
+  } else if (smooth_models[[i, 'response']] %in% daily_from_hour_avg_responses) {
+    if (smooth_models[[i, 'daterange']] == 'full') {
+      data <- daily_ha_full_train
+    } else {
+      data <- get(paste0('daily_ha_', smooth_models[[i, 'daterange']], '_train'))
+    }
+  }
+
+  formula_str <- paste(smooth_models[[i, 'response']], formula_feature_str, sep = ' ~ ')
+  formula <- as.formula(formula_str)
+  residuals <- gam(formula, data = data, method = 'GCV.Cp')$residuals
+  smooth_models$residuals[i] <- list(residuals)
+}
+```
+
+### Fit residuals to select linear features
+```{r, message = FALSE}
+everything_predictors <- c('year', 
+                           "month_sin", "month_cos", 
+                           "weekday_sin","weekday_cos",
+                           "julian_sin","julian_cos",
+                           'inv_dist_wrp_p2', 'inv_dist_ref_p2', 'inv_dist_dc_p2',
+                           'monthly_oil_2km', 'monthly_gas_2km', 'active_2km',
+                           'inactive_2km', 'elevation', 'EVI',
+                           'num_odor_complaints', 'closest_wrp_capacity')
+
+
+daha_predictors <- c('daily_downwind_ref', 'daily_downwind_wrp', 'daily_temp',
+                     'daily_hum', 'daily_precip', "daily_wd_sin", "daily_wd_cos", 'daily_ws')
+dmha_predictors <-
+  c('hourly_downwind_ref', 'hourly_downwind_wrp', 'hourly_temp',
+    'hourly_hum', 'hourly_precip', "hourly_wd_sin", "hourly_wd_cos", 'hourly_ws')
+
+hourly_predictors <- c("hour_sin", "hour_cos",
+                       'hourly_downwind_ref', 'hourly_downwind_wrp', 'hourly_temp',
+                       'hourly_hum', 'hourly_precip', "wd_sin", "wd_cos", "ws_avg")
+
+everything_linear_pred_str <- paste(everything_predictors, collapse = ' + ')
+daily_avg_of_hourly_avg_linear_pred_str <- paste(daha_predictors, collapse = ' + ')
+daily_max_of_hourly_avg_linear_pred_str <- paste(dmha_predictors, collapse = ' + ')
+hourly_linear_pred_str <- paste(hourly_predictors, collapse = ' + ')
+
+for (i in 1:nrow(smooth_models)) {
+  # Create formula
+  if (smooth_models[[i, 'daterange']] == 'dis_ind' &
+      smooth_models[[i, 'response']] %in% hourly_responses) {
+    # Hourly w. indicator
+    formula_str <- paste(everything_linear_pred_str, hourly_linear_pred_str,
+                         'disaster', sep = ' + ')
+    print(paste0(smooth_models[[i, 'daterange']], ': everything hourly + ind'))
+  } else if (smooth_models[[i, 'response']] %in% hourly_responses) {
+    # Hourly otherwise.
+    formula_str <- paste(everything_linear_pred_str,
+                         hourly_linear_pred_str, sep = ' + ')
+    print(paste0(smooth_models[[i, 'daterange']], ': everything hourly'))
+  } else if(smooth_models[[i, 'daterange']] == 'dis_ind' &
+            smooth_models[[i, 'response']] %in% c("H2S_daily_avg_from_hourly_avg",
+                                                  "log(H2S_daily_avg_from_hourly_avg)")) {
+    # Daily avg from hourly avg w. indicator
+    formula_str <- paste(everything_linear_pred_str, daily_avg_of_hourly_avg_linear_pred_str,
+                         'disaster', sep = ' + ')
+    print(paste0(smooth_models[[i, 'daterange']], ': everything daily avg from hourly avg + ind'))
+  } else if (smooth_models[[i, 'response']] %in% c("H2S_daily_avg_from_hourly_avg",
+                                                  "log(H2S_daily_avg_from_hourly_avg)")) {
+    # Daily avg from hourly avg otherwise.
+    formula_str <- paste(everything_linear_pred_str,
+                         daily_avg_of_hourly_avg_linear_pred_str, sep = ' + ')
+    print(paste0(smooth_models[[i, 'daterange']], ': everything daily avg from hourly avg'))
+  } else if(smooth_models[[i, 'daterange']] == 'dis_ind' &
+            smooth_models[[i, 'response']] %in% c("H2S_daily_max_from_hourly_avg",
+                                                  "log(H2S_daily_max_from_hourly_avg)")) {
+    # Daily max from hourly avg w. indicator
+    formula_str <- paste(everything_linear_pred_str, daily_max_of_hourly_avg_linear_pred_str,
+                         'disaster', sep = ' + ')
+    print(paste0(smooth_models[[i, 'daterange']], ': everything daily max from hourly avg + ind'))
+  } else if (smooth_models[[i, 'response']] %in% c("H2S_daily_max_from_hourly_avg",
+                                                  "log(H2S_daily_max_from_hourly_avg)")) {
+    # Daily max from hourly avg otherwise.
+    formula_str <- paste(everything_linear_pred_str,
+                         daily_max_of_hourly_avg_linear_pred_str, sep = ' + ')
+    print(paste0(smooth_models[[i, 'daterange']], ': everything daily max from hourly avg'))
+  }
+
+  formula_str <- paste('residuals', formula_str, sep = ' ~ ')
+  formula <- as.formula(formula_str)
+
+  # Assign dataset
+  if (smooth_models[[i, 'response']] %in% hourly_responses) {
+    if (smooth_models[[i, 'daterange']] == 'full') {
+      data <- hourly_full_train
+    } else {
+      data <- get(paste0('hourly_', smooth_models[[i, 'daterange']], '_train'))
+    }
+  } else if (smooth_models[[i, 'response']] %in% daily_from_hour_avg_responses) {
+    if (smooth_models[[i, 'daterange']] == 'full') {
+      data <- daily_ha_full_train
+    } else {
+      data <- get(paste0('daily_ha_', smooth_models[[i, 'daterange']], '_train'))
+    }
+  }
+
+  data$year <- as.factor(data$year)
+  data$residuals <- unlist(smooth_models$residuals[i])
+  regsubsets <- regsubsets(formula, data, nvmax = Inf)
+  assign(paste0(smooth_models$name[i], '_regsubsets'), regsubsets)
+  print(str_glue('Completed {i} rows'))
+}
+```
+
+### Get best model size for each model
+```{r}
+best_model_sizes <- smooth_models %>%
+  group_by(name, response, daterange) %>%
+  summarise(mean_smooth_res = mean(unlist(residuals)),
+            var_smooth_res = round(var(unlist(residuals))), 4) %>%
+  select(any_of(c('name', 'response', 'daterange',
+                  'mean_smooth_res', 'var_smooth_res'))) %>%
+  mutate(Adj.R2 = NA,
+         best_R2 = NA,
+         CP = NA,
+         best_CP = NA,
+         BIC = NA,
+         best_BIC = NA,
+         linear_features = NA)
+
+for (i in 1:nrow(smooth_models)) {
+  regsubset <- summary(get(paste0(smooth_models$name[i], '_regsubsets')))
+  best_sizes <- tibble(Adj.R2 = which.max(regsubset$adjr2),
+                       best_R2 = regsubset$adjr2[which.max(regsubset$adjr2)],
+                       CP = which.min(regsubset$cp),
+                       best_CP = regsubset$cp[which.max(regsubset$cp)],
+                       BIC = which.min(regsubset$bic),
+                       best_BIC = regsubset$bic[which.max(regsubset$bic)],)
+  best_features <- tibble(linear_features = list(setdiff(names(regsubset$which[best_sizes$CP, ]
+                                                   [unlist(regsubset$which[best_sizes$CP, ])]), '(Intercept)')))
+  best_model_sizes[i,] <- bind_cols(best_model_sizes[i, 1:5], best_sizes, best_features)
+}
+
+best_gam_models <- best_model_sizes %>%
+  rowwise() %>%
+  mutate(smooth_features = if_else(daterange == 'dis', list(smooth_predictors[2:3]),
+                                   list(smooth_predictors))) %>%
+  mutate(full_features = list(c(unlist(smooth_features), unlist(linear_features)))) %>%
+  ungroup()
+```
+
+## Final models {.tabset .tabset-pills}
+
+```{r}
+# write function that takes in response, predictors, data and returns gam model 
+# different from stepwise function, this has select = FALSE
+get_feature_vector <- function(response, daterange) {
+  feature_vec <-  best_gam_models %>%
+      filter(response == .env$response & daterange == .env$daterange) %>%
+      pull(full_features) %>%
+      unlist()
+  # feature_vec <- str_replace_all(feature_vec, 'month\\d+', 'month')
+  feature_vec <- str_replace_all(feature_vec, 'year\\d+', 'year')
+  # feature_vec <- str_replace_all(feature_vec, 'weekday\\D+', 'weekday')
+  feature_vec <- unique(feature_vec)
+  return(feature_vec)
+}
+
+get_data <- function(response, daterange, type) {
+  if (response %in% hourly_responses) {
+      data <- get(paste0('hourly_', daterange, '_', type))
+  } else if (response %in% daily_from_hour_avg_responses) {
+      data <- get(paste0('daily_ha_', daterange, '_', type))
+  }
+  
+  return(data)
+}
+
+
+get_gam_model <- function(response, daterange) {
+  predictors <- get_feature_vector(response, daterange)
+  formula_feature_str <- paste(predictors, collapse = ' + ')
+  formula_str <- paste(response, formula_feature_str, sep = ' ~ ')
+  formula <- as.formula(formula_str)
+  
+  data <- get_data(response, daterange, 'train')
+  data$year <- as.factor(data$year)
+  gam_model <- gam(formula, data = data, method = 'GCV.Cp')
+  return(gam_model)
+}
+
+for (i in 1:nrow(best_gam_models)) {
+  print(paste0(best_gam_models$response[i], ' ', best_gam_models$daterange[i]))
+  assign(paste0(best_gam_models$name[i], '_gam'),
+         get_gam_model(best_gam_models$response[i], best_gam_models$daterange[i]))
+}
+```
+
+```{r}
+get_gam_result <- function(model_obj, model_name){
+  p <- summary(model_obj)$p.pv
+  coef <- tibble(Term = names(summary(model_obj)$p.coeff), x = summary(model_obj)$p.coeff) %>%
+              mutate(x = paste0(formatC(x, format = 'e', digits = 2), 
+                              case_when(p < 0.001 ~ '***', 
+                                        0.001 <= p & p < 0.01 ~ '**', 
+                                        0.01 <= p & p < 0.05 ~ '*', 
+                                        0.05 <= p & p < 0.1 ~ '.', 
+                                        TRUE ~ '')))  %>%
+              rename({{model_name}} := x)
+  coef <- rbind(coef, tibble(Term = 'Adj.R-sq', {{model_name}} := 
+                             formatC(summary(model_obj)$r.sq, format = 'e', 
+                             digits = 2)))
+  return(coef)
+}
+```
+
+### Daily avg from hourly avg
+
+Exclude Event	
+```{r}
+# Exclude Event
+summary(daha_excl_dis_gam)
+```
+
+Everything w.o Disaster Indicator	
+```{r}
+# Everything
+summary(daha_full_gam)
+```
+
+### Log Daily avg from hourly avg
+
+Exclude Event	
+```{r}
+# Exclude Event
+summary(log_daha_excl_dis_gam)
+```
+
+
+Everything w.o Disaster Indicator	
+```{r}
+# Everything
+summary(log_daha_full_gam)
+```
+
+### Hourly avg
+
+Exclude Event	
+```{r}
+# Exclude Event
+summary(ha_excl_dis_gam)
+```
+
+
+Everything w.o Disaster Indicator	
+```{r}
+# Everything
+summary(ha_full_gam)
+```
+
+### Log Hourly avg
+Exclude Event	
+```{r}
+# Exclude Event
+summary(log_daha_excl_dis_gam)
+```
+
+Everything w.o Disaster Indicator	
+```{r}
+# Everything
+summary(log_daha_full_gam)
+```
+
+
+
+# GAM result {.tabset .tabset-pills}
+```{r}
+adj_r2 <- function(r2, n, p){
+  # n-p since p here includes intercept
+  return(1 - (1-r2)*(n - 1)/(n - p))
+}
+
+get_bt_adj_r2 <- function(model, data, response_colname, predictions) {
+  bt_R2 <- R2(data %>% pull(response_colname), exp(predictions))
+  bt_adj_r2 <- adj_r2(bt_R2, summary(model)$n, summary(model)$np)
+  return(bt_adj_r2)
+}
+
+get_bt_rmse <- function(model, data, predictions) {
+  response_colname <- names(model$model)[1]
+  response_colname <- str_sub(response_colname, 5, -2)
+  bt_RMSE <- RMSE(data %>% pull(response_colname), exp(predictions))
+  return(bt_RMSE)
+}
+```
+
+```{r, fig.width=15}
+date_names <- c('Exclude Event',
+                'Everything w.o Disaster Indicator')
+response_disp_names <- c('Daily Avg From Hourly Avg', 'Log Daily Avg From Hourly Avg',
+                         'Daily Max From Hourly Avg', 'Log Daily Max From Hourly Avg',
+                         'Hourly Avg', 'Log Hourly Avg')
+
+gam_result_table <- expand.grid(date_names, response_disp_names) %>%
+  setNames(c('date_names', 'response_disp_names'))
+
+date_name_conversion <- tibble(date_names = date_names,
+                               daterange = dateranges)
+
+response_name_conversion <- tibble(response_disp_names = unique(gam_result_table$response_disp_names),
+                                   response_obj_name = c(daily_from_hour_avg_responses,
+                                                         hourly_responses),
+                                   model_response_name = response_names,
+                                   transformation = rep(c('', 'Log'), 3))
+
+gam_result_table <- gam_result_table %>%
+  left_join(date_name_conversion) %>%
+  left_join(response_name_conversion)
+
+gam_result_table <- gam_result_table %>%
+  mutate(adjr2_train = NA,
+         R2_test = NA,
+         R2_test_event = NA,
+         R2_test_normal = NA,
+         RMSE_test = NA,
+         RMSE_test_event = NA,
+         RMSE_test_normal = NA,
+         bt_adjR2_train = NA,
+         bt_R2_test = NA,
+         bt_R2_test_event = NA,
+         bt_R2_test_normal = NA,
+         bt_RMSE_test = NA,
+         bt_RMSE_test_event = NA,
+         bt_RMSE_test_normal = NA,
+         n_train = NA,
+         n_test = NA,
+         p = NA,
+         negative_train = NA,
+         negative_test = NA)
+
+weekday_labels <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+for (i in 1:nrow(gam_result_table)) {
+  name <- gam_result_table$model_response_name[i]
+  response <- gam_result_table$response_obj_name[i]
+  daterange <- gam_result_table$daterange[i]
+  model <- get(paste0(name,'_', daterange, '_gam'))
+
+  curr_train_data <- get_data(response, daterange, 'train')
+  curr_test_data <- get_data(response, daterange, 'test')
+  curr_train_data <- curr_train_data %>%
+    mutate(year = as.character(year),
+           weekday = weekday_labels[weekday],
+           month= as.character(month)
+           )
+
+  curr_test_data <- curr_test_data %>%
+    mutate(year = as.character(year),
+           weekday = weekday_labels[weekday],
+           month= as.character(month)
+           )
+
+  if (daterange == 'full') {
+    disaster <- get_data(response, daterange, 'test')
+    disaster <- disaster$year == 2021 & disaster$month %in% 10:12
+  } else {
+    disaster <- rep(TRUE, nrow(curr_test_data))
+  }
+
+  train_pred <- predict(model, curr_train_data)
+  test_pred <- predict(model, curr_test_data)
+
+  if (str_detect(response, 'log\\(')) {
+      response_colname <- names(model$model)[1]
+      response_colname <- str_sub(response_colname, 5, -2)
+      R2_test <- R2(log(curr_test_data %>% pull(response_colname)), test_pred)
+      R2_test_event <-  R2(log((curr_test_data %>% pull(response_colname)))[disaster],
+                              (test_pred)[disaster])
+      R2_test_normal <-  R2(log((curr_test_data %>% pull(response_colname)))[!disaster],
+                               (test_pred[!disaster]))
+      RMSE_test_event <- RMSE(log((curr_test_data %>% pull(response_colname)))[disaster],
+                                 (test_pred)[disaster])
+      RMSE_test_normal <- RMSE(log((curr_test_data %>% pull(response_colname)))[!disaster],
+                                  (test_pred)[!disaster])
+
+      RMSE_test <- RMSE(log(curr_test_data %>% pull(response_colname)), test_pred)
+
+      bt_adjR2_train <- get_bt_adj_r2(model, curr_train_data, response_colname, train_pred)
+
+      bt_R2_test <-  R2(curr_test_data %>% pull(response_colname), exp(test_pred))
+      bt_R2_test_event <-  R2((curr_test_data %>% pull(response_colname))[disaster],
+                              exp(test_pred)[disaster])
+      bt_R2_test_normal <-  R2((curr_test_data %>% pull(response_colname))[!disaster],
+                               exp(test_pred[!disaster]))
+      bt_RMSE_test <- RMSE(curr_test_data %>% pull(response_colname) , exp(test_pred))
+      bt_RMSE_test_event <- RMSE((curr_test_data %>% pull(response_colname))[disaster],
+                                 exp(test_pred)[disaster])
+      bt_RMSE_test_normal <- RMSE((curr_test_data %>% pull(response_colname))[!disaster],
+                                  exp(test_pred)[!disaster])
+      negative_train <- 0
+      negative_test <- 0
+  } else {
+    R2_test <- R2(curr_test_data %>% pull(response), test_pred)
+    R2_test_event <- R2((curr_test_data %>% pull(response))[disaster], test_pred[disaster])
+    R2_test_normal <- R2((curr_test_data %>% pull(response))[!disaster], test_pred[!disaster])
+    RMSE_test <- RMSE(curr_test_data %>% pull(response), test_pred)
+    RMSE_test_event <- RMSE((curr_test_data %>% pull(response))[disaster], test_pred[disaster])
+    RMSE_test_normal <- RMSE((curr_test_data %>% pull(response))[!disaster], test_pred[!disaster])
+
+    bt_adjR2_train <- NA
+    bt_R2_test <- NA
+    bt_R2_test_event <- NA
+    bt_R2_test_normal <- NA
+    bt_RMSE_test <- NA
+    bt_RMSE_test_event <- NA
+    bt_RMSE_test_normal <- NA
+    negative_train <- sum(model$fitted.values < 0)
+    negative_test <- sum(test_pred < 0)
+  }
+
+  adjR2_train <- summary(model)$r.sq
+  n_train <- summary(model)$n
+  p <- summary(model)$np
+  n_test <- nrow(curr_test_data)
+
+  new_columns <- tibble(adjR2_train = adjR2_train,
+                        R2_test = R2_test,
+                        R2_test_event = R2_test_event,
+                        R2_test_normal = R2_test_normal,
+                        RMSE_test = RMSE_test,
+                        RMSE_test_event = RMSE_test_event,
+                        RMSE_test_normal = RMSE_test_normal,
+                        bt_adjR2_train = bt_adjR2_train,
+                        bt_R2_test = bt_R2_test,
+                        bt_R2_test_event = bt_R2_test_event,
+                        bt_R2_test_normal = bt_R2_test_normal,
+                        bt_RMSE_test = bt_RMSE_test,
+                        bt_RMSE_test_event = bt_RMSE_test_event,
+                        bt_RMSE_test_normal = bt_RMSE_test_normal,
+                        n_train = n_train,
+                        n_test = n_test,
+                        p = p,
+                        negative_train = negative_train,
+                        negative_test = negative_test)
+  new_row <- bind_cols(gam_result_table[i, 1:6], new_columns)
+  gam_result_table[i,] <- new_row
+  print(str_glue('Completed {i} iterations'))
+}
+```
+
+```{r}
+temp <- rep(rep(response_disp_names[!str_detect(response_disp_names, 'Log')], each =2), 3)
+
+base_table <- gam_result_table %>%
+  filter(transformation == '') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  arrange(factor(date_names, levels = unique(gam_result_table$date_names))) %>%
+  select(-transformation, -contains('BT_'), -contains('_train'))
+
+log_table <- gam_result_table %>%
+  filter(transformation == 'Log') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  arrange(factor(date_names, levels = unique(gam_result_table$date_names))) %>%
+  select('date_names', 'response_disp_names', 'n_test', contains('BT_'))
+```
+
+```{r}
+top <- base_table %>%
+  filter(date_names!='Everything w. Disaster Indicator') %>% 
+  select('date_names', 'response_disp_names', 'n_test', 'R2_test', 'RMSE_test', 
+         'R2_test_event', 'RMSE_test_event',
+         'R2_test_normal', 'RMSE_test_normal')
+
+bottom <- log_table %>%
+  filter(date_names!='Everything w. Disaster Indicator') %>% 
+  select('date_names', 'response_disp_names', 'n_test', 'bt_R2_test', 'bt_RMSE_test', 
+         'bt_R2_test_event', 'bt_RMSE_test_event',
+         'bt_R2_test_normal', 'bt_RMSE_test_normal') %>%
+  rename_with(~gsub("bt_", "", .x, fixed = TRUE))
+
+gam_result_table <- bind_rows(top,bottom) %>%
+  mutate('date_names' = ' ') %>%
+  setNames(c("Time period", "Response", "N", rep(c("R2", "RMSE"), 3)))
+
+gam_result_table %>%
+  knitr::kable(format = 'pipe', digits = 4, table.attr = "style='width:100%;'") %>%
+  pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3,
+                      "Exclude Event" = 3,  "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 3, 'Full' = 2, 'Event' = 2, 'Routine' = 2)) %>%
+  kable_styling()
+```

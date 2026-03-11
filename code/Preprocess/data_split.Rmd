@@ -1,0 +1,85 @@
+---
+title: "80/20 data prep"
+output: html_document
+date: "2025-12-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(caret)
+```
+
+# Load data
+```{r}
+# Load in
+hourly_full_raw <- readRDS('../../data/hourly.rds')
+daily_from_hour_avg_full_raw <- readRDS('../../data/daily_from_hourly_avg.rds')
+```
+
+# Cleaning
+```{r}
+daily_from_hour_avg_full <- daily_from_hour_avg_full_raw %>%
+  mutate(Monitor = str_replace_all(Monitor, ' ', '_'),
+         daily_downwind_ref = as.integer(daily_downwind_ref),
+         daily_downwind_wrp = as.integer(daily_downwind_wrp),
+         hourly_downwind_ref = as.integer(hourly_downwind_ref),
+         hourly_downwind_wrp = as.integer(hourly_downwind_wrp),
+         dist_ref = 1/(dist_ref^2),
+         dist_wrp = 1/(dist_wrp^2),
+         dist_dc = 1/(dist_dc^2)) %>%
+  mutate(disaster = if_else(year == '2021' & month %in% c('10', '11', '12'), 1, 0),
+         month = as.numeric(month),
+         year = as.numeric(year),
+         weekday = as.numeric(weekday))
+  
+
+hourly_full <- hourly_full_raw %>%
+  mutate(Monitor = str_replace_all(Monitor, ' ', '_'),
+         weekday = weekday,
+         hourly_downwind_ref = as.integer(hourly_downwind_ref),
+         hourly_downwind_wrp = as.integer(hourly_downwind_wrp),
+         dist_ref = 1/(dist_ref^2),
+         dist_wrp = 1/(dist_wrp^2),
+         dist_dc = 1/(dist_dc^2),
+         julian = julian(as.Date(hourly_full_raw$day), 
+                         origin = as.Date("2020-01-01"))) %>%
+  filter(!is.na(H2S_hourly_avg)) %>%
+  mutate(disaster = if_else(year == '2021' & month %in% c('10', '11', '12'), 1, 0),
+         month = as.numeric(month),
+         year = as.numeric(year),
+         weekday = as.numeric(weekday))
+
+any(colSums(is.na(daily_from_hour_avg_full)))
+any(colSums(is.na(hourly_full)))
+```
+
+# 80/20 split
+```{r}
+set.seed(42)
+# 80/20 split
+daily_from_hour_avg_full_train <- daily_from_hour_avg_full %>%
+  sample_frac(0.8)
+
+daily_from_hour_avg_full_test <- daily_from_hour_avg_full %>%
+  anti_join(daily_from_hour_avg_full_train, join_by(day, Monitor))
+
+hourly_full <- hourly_full %>%
+  rowid_to_column()
+
+hourly_full_train <- hourly_full %>%
+  sample_frac(0.8)
+
+hourly_full_test <- hourly_full %>%
+  anti_join(hourly_full_train, join_by(rowid))
+```
+
+```{r}
+# saveRDS(daily_from_hour_avg_full_train, '../../data/daily_ha_train.rds')
+# saveRDS(daily_from_hour_avg_full_test, '../../data/daily_ha_test.rds')
+# saveRDS(hourly_full_train, '../../data/hourly_train.rds')
+# saveRDS(hourly_full_test, '../../data/hourly_test.rds')
+```
+
+
+

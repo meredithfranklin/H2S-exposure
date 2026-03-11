@@ -1,0 +1,3697 @@
+---
+title: "Data Modelling V42 (New time and wind variables + weight for XGB (removed 2021-04-27 2 GStreet))"
+author: "Jerry Wu"
+date: "2026-01-12"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+abstract: ''
+subtitle: ''
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(caret)
+library(xgboost)
+library(circular)
+library(raster)
+library(terra)
+library(sf)
+library(ggpubr)
+library(ggpmisc)
+library(leaps)
+library(kableExtra)
+library(gginnards)
+library(patchwork)
+library(arrow)
+select <- dplyr::select
+```
+
+# Load in data {.tabset .tabset-pills}
+## Full data
+```{r}
+hourly_full <- readRDS('../../data/hourly.rds')
+daily_from_hour_avg_full <- readRDS('../../data/daily_from_hourly_avg.rds')
+```
+
+## Splitted data
+```{r}
+daily_ha_train <- readRDS('../../data/daily_ha_train.rds')
+daily_ha_test <- readRDS('../../data/daily_ha_test.rds')
+hourly_train <- readRDS('../../data/hourly_train.rds')
+hourly_test <- readRDS('../../data/hourly_test.rds')
+```
+
+```{r}
+# Rename columns for clarity, as it's already transformed.
+rename_dist <- c('inv_dist_ref_p2' = 'dist_ref',
+                 'inv_dist_dc_p2' = 'dist_dc',
+                 'inv_dist_wrp_p2' = 'dist_wrp')
+
+daily_ha_train <- daily_ha_train %>%
+  rename(rename_dist)
+daily_ha_test <- daily_ha_test %>%
+  rename(rename_dist)
+hourly_train <- hourly_train %>%
+  rename(rename_dist)
+hourly_test <- hourly_test %>%
+  rename(rename_dist)
+```
+
+## Add new variables
+```{r}
+deg2rad <- function(x) x * pi / 180
+
+make_features <- function(df,
+                          id_col = "Monitor",
+                          time_col = "timestamp",
+                          wd_col = 'wd_avg', 
+                          ws_col = 'ws_avg') {
+   
+    df2 <- df %>%
+      group_by(.data[[id_col]]) %>%
+      arrange(.data[[time_col]], .by_group = TRUE) %>%
+      mutate(
+        # time parts
+        hour   = hour(.data[[time_col]]),          # 0 to 23
+        month  = month(.data[[time_col]]),         # 1 to 12
+        julian = yday(.data[[time_col]]),          # 1 to 365/366
+  
+        # cyclic time (fourier)
+        hour_sin   = sin(2 * pi * hour / 24),
+        hour_cos   = cos(2 * pi * hour / 24),
+        weekday_sin = sin(2 * pi * weekday / 7),
+        weekday_cos = cos(2 * pi * weekday / 7),
+        month_sin  = sin(2 * pi * month / 12),
+        month_cos  = cos(2 * pi * month / 12),
+        julian_sin = sin(2 * pi * julian / 365.25),
+        julian_cos = cos(2 * pi * julian / 365.25),
+  
+        # wind transforms
+        wd_rad = deg2rad(.data[[wd_col]]),
+        wd_sin = sin(wd_rad),
+        wd_cos = cos(wd_rad)#,
+        # wind_u = .data[[wd_col]] * wd_cos,
+        # wind_v = .data[[ws_col]] * wd_sin
+      ) %>%
+      ungroup()
+
+  
+  df2 %>%
+      select(-wd_rad)  
+}
+
+# run them on training and test
+hourly_train <- hourly_train %>%
+  mutate(timestamp = as.POSIXct(dayhour, format = "%Y-%m-%d %H", tz = "America/Los_Angeles"))
+
+hourly_test <- hourly_test %>%
+  mutate(timestamp = as.POSIXct(dayhour, format = "%Y-%m-%d %H", tz = "America/Los_Angeles"))
+
+hourly_train <- make_features(hourly_train, id_col = "Monitor", time_col = "timestamp")
+hourly_test <- make_features(hourly_test, id_col = "Monitor", time_col = "timestamp")
+
+# Compute for daily average features 
+daily_ha_train <- make_features(daily_ha_train, id_col = "Monitor", time_col = "day", 
+                                wd_col = 'daily_wd', ws_col = 'daily_ws')
+daily_ha_test <- make_features(daily_ha_test, id_col = "Monitor", time_col = "day", 
+                               wd_col = 'daily_wd', ws_col = 'daily_ws')
+
+daily_ha_train <- daily_ha_train %>%
+  rename('daily_wd_sin' = 'wd_sin',
+         'daily_wd_cos' = 'wd_cos')
+
+daily_ha_test <- daily_ha_test %>%
+  rename('daily_wd_sin' = 'wd_sin',
+         'daily_wd_cos' = 'wd_cos')
+
+# Compute for daily max features
+daily_ha_train <- make_features(daily_ha_train, id_col = "Monitor", time_col = "day", 
+                                wd_col = 'hourly_wd', ws_col = 'hourly_ws')
+daily_ha_test <- make_features(daily_ha_test, id_col = "Monitor", time_col = "day", 
+                               wd_col = 'hourly_wd', ws_col = 'hourly_ws')
+
+daily_ha_train <- daily_ha_train %>%
+  rename('hourly_wd_sin' = 'wd_sin',
+         'hourly_wd_cos' = 'wd_cos')
+
+daily_ha_test <- daily_ha_test %>%
+  rename('hourly_wd_sin' = 'wd_sin',
+         'hourly_wd_cos' = 'wd_cos')
+```
+
+```{r}
+# Exclude Event stepwise
+hourly_excl_dis_train <- hourly_train %>% 
+  filter(!(year == '2021' & month %in% c('10', '11', '12')))
+daily_ha_excl_dis_train <- daily_ha_train %>% 
+  filter(!(year == '2021' & month %in% c('10', '11', '12')))
+
+hourly_excl_dis_test<- hourly_test %>% 
+  filter(!(year == '2021' & month %in% c('10', '11', '12')))
+daily_ha_excl_dis_test <- daily_ha_test %>% 
+  filter(!(year == '2021' & month %in% c('10', '11', '12')))
+
+# Everything w.o disaster indicator
+hourly_full_train <- hourly_train %>%
+  select(-disaster)
+daily_ha_full_train <- daily_ha_train %>%
+  select(-disaster)
+
+hourly_full_test <- hourly_test %>%
+  select(-disaster)
+daily_ha_full_test <- daily_ha_test %>%
+  select(-disaster)
+```
+
+
+# XGBoost {.tabset .tabset-pills}
+## Helpers and setup {.tabset .tabset-pills}
+```{r}
+# Save path
+model_folder <- '../rfiles/xgboost_v41/' # For all models
+fi_folder <- '../figures/feature_importance_v22/'
+ovp_folder <- '../figures/obs_vs_pred_v22/'
+loso_folder <- '../figures/loso_plots/'
+loeo_folder <- '../figures/loeo_plots/'
+```
+
+```{r}
+# Result tables
+test_result <- tibble(
+  Model = character(),
+  model_response_name = character(),
+  daterange = character(),
+  "R2" = numeric(),
+  "RMSE" = numeric(),
+  "coef" = numeric(),
+  "BT_R2" = numeric(),
+  "BT_RMSE" = numeric(),
+  "BT_coef" = numeric(),
+  "event_R2" = numeric(),
+  "event_RMSE" = numeric(),
+  "event_coef" = numeric(),
+  "normal_R2" = numeric(),
+  "normal_RMSE" = numeric(),
+  "normal_coef" = numeric(),
+  "BT_event_R2" = numeric(),
+  "BT_event_RMSE" = numeric(),
+  "BT_event_coef" = numeric(),
+  "BT_normal_R2" = numeric(),
+  "BT_normal_RMSE" = numeric(),
+  "BT_normal_coef" = numeric()
+)
+
+spatial_test_result <- tibble(
+  Model = character(),
+  model_response_name = character(),
+  daterange = character(),
+  "lag" = character(),
+  "coordinates" = character(),
+  "R2" = numeric(),
+  "RMSE" = numeric(),
+  "coef" = numeric(),
+  "R2_mean" = numeric(),
+  "RMSE_mean" = numeric(),
+  "coef_mean" = numeric(),
+  "event_R2" = numeric(),
+  "event_RMSE" = numeric(),
+  "event_coef" = numeric(),
+  "normal_R2" = numeric(),
+  "normal_RMSE" = numeric(),
+  "normal_coef" = numeric()
+)
+
+spatial_weighted_test_result <- tibble(
+  Model = character(),
+  model_response_name = character(),
+  daterange = character(),
+  "lag" = character(),
+  "coordinates" = character(),
+  "R2" = numeric(),
+  "RMSE" = numeric(),
+  "coef" = numeric(),
+  "R2_mean" = numeric(),
+  "RMSE_mean" = numeric(),
+  "coef_mean" = numeric(),
+  "event_R2" = numeric(),
+  "event_RMSE" = numeric(),
+  "event_coef" = numeric(),
+  "normal_R2" = numeric(),
+  "normal_RMSE" = numeric(),
+  "normal_coef" = numeric()
+)
+
+temporal_test_result <- tibble(
+  Model = character(),
+  model_response_name = character(),
+  daterange = character(),
+  "R2" = numeric(),
+  "RMSE" = numeric(),
+  "coef" = numeric()
+)
+
+test_result_unstrat <- test_result
+
+negative_pred <- tibble(Model = character(),
+  model_response_name = character(),
+  daterange = character(),
+  "negative" = numeric())
+```
+
+```{r}
+daha_names <- c(
+  "Average Daily Temperature" = "daily_temp",
+  "Average Daily Humidity" = "daily_hum",
+  "Daily Precipitation" = "daily_precip",
+  "Average Daily Wind Speed" = "daily_ws",
+  "Average Daily Wind Direction (sin)" = "daily_wd_sin",
+  "Average Daily Wind Direction (cos)" = "daily_wd_cos",
+  "Downwind Refinery" = "daily_downwind_ref",
+  "Downwind WRP" = "daily_downwind_wrp"
+)
+
+ha_names <- c(
+  "Hourly Temperature" = "hourly_temp",
+  "Hourly Humidity" = "hourly_hum",
+  "Hourly Precipitation" = "hourly_precip",
+  "Hourly Wind Speed" = "ws_avg",
+  "Hourly Wind Direction (sin)" = "wd_sin",
+  "Hourly Wind Direction (cos)" = "wd_cos",
+  "Downwind Refinery" = "hourly_downwind_ref",
+  "Downwind WRP" = "hourly_downwind_wrp"
+)
+
+dmha_names <- c(
+  "Hourly Temperature at peak H2S" = "hourly_temp",
+  "Hourly Humidity at peak H2S" = "hourly_hum",
+  "Hourly Precipitation at peak H2S" = "hourly_precip",
+  "Hourly Wind Speed at peak H2S" = "hourly_ws",
+  "Hourly Wind Direction at peak H2S (sin)" = "hourly_wd_sin",
+  "Hourly Wind Direction at peak H2S (cos)" = "hourly_wd_cos",
+  "Downwind Refinery at peak H2S" = "hourly_downwind_ref",
+  "Downwind WRP at peak H2S" = "hourly_downwind_wrp",
+  "Hourly Wind Speed"  = "hourly_ws_avg"
+)
+
+fixed_names <- c(
+  "Longitude" = "mon_utm_x",
+  "Latitude" = "mon_utm_y",
+  "Distance to Refinery" = "dist_ref",
+  "Angle to Refinery" = "angle_ref",
+  "Active Wells within 2km" = "active_2km",
+  "Inactive Wells within 2km" = "inactive_2km",
+  "Monthly Oil Production 2km" = "monthly_oil_2km",
+  "Monthly Gas Production 2km" = "monthly_gas_2km",
+  "Distance to WRP" = "dist_wrp",
+  "WRP Capacity" = "closest_wrp_capacity",
+  "Angle to WRP" = "angle_wrp",
+  "Distance to Dominguez Channel" = "dist_dc",
+  "Elevation" = "elevation",
+  "Enhanced Vegetation Index" = "EVI",
+  "Number of Daily Odor Complaints" = "num_odor_complaints",
+  "Odor Event" = "disaster",
+  "Year" = "year",
+  "Hour of Day (sin)" = "hour_sin",
+  "Hour of Day (cos)" = "hour_cos",
+  "Month of Year (sin)" = "month_sin",
+  "Month of Year (cos)" = "month_cos",
+  "Day of Week (sin)" = "weekday_sin",
+  "Day of Week (cos)" = "weekday_cos",
+  "Day of Year (sin)" = "julian_sin",
+  "Day of Year (cos)" = "julian_cos"
+)
+```
+
+```{r}
+hourly_predictors <- c('year',
+                       'month_sin', 'month_cos',
+                       'hour_sin', 'hour_cos',
+                       'weekday_sin', 'weekday_cos',
+                       'julian_sin', 'julian_cos',
+                       'wd_sin', 'wd_cos', 'ws_avg', 
+                       'hourly_downwind_ref', 'dist_wrp', 'dist_ref',
+                       'mon_utm_x', 'mon_utm_y', 'monthly_oil_2km', 'monthly_gas_2km', 
+                       'active_2km', 'inactive_2km', 'hourly_downwind_wrp', 
+                       'elevation', 'EVI', 'num_odor_complaints',
+                       'dist_dc', 'closest_wrp_capacity', 'hourly_temp', 'hourly_hum', 'hourly_precip') 
+
+da_predictors <- c('year',
+                   'month_sin', 'month_cos',
+                   'hour_sin', 'hour_cos',
+                   'weekday_sin', 'weekday_cos',
+                   'julian_sin', 'julian_cos',
+                   'daily_wd_sin', 'daily_wd_cos', 'daily_ws', 
+                   'daily_downwind_ref', 'dist_wrp', 'dist_ref',
+                   'mon_utm_x', 'mon_utm_y', 'monthly_oil_2km', 'monthly_gas_2km', 
+                   'active_2km', 'inactive_2km', 'daily_downwind_wrp', 'elevation', 'EVI', 'num_odor_complaints',
+                   'dist_dc', 'closest_wrp_capacity', 'daily_temp', 'daily_hum', 'daily_precip') 
+
+dm_predictors <- c('year',
+                   'month_sin', 'month_cos',
+                   'hour_sin', 'hour_cos',
+                   'weekday_sin', 'weekday_cos',
+                   'julian_sin', 'julian_cos',
+                   'hourly_wd_sin', 'hourly_wd_cos', 'hourly_ws', 
+                   'hourly_downwind_ref', 'dist_wrp', 'dist_ref',
+                   'mon_utm_x', 'mon_utm_y', 'monthly_oil_2km', 'monthly_gas_2km', 
+                   'active_2km', 'inactive_2km', 'hourly_downwind_wrp', 'elevation', 'EVI', 'num_odor_complaints',
+                   'dist_dc', 'closest_wrp_capacity', 'hourly_temp', 'hourly_hum', 'hourly_precip') 
+
+rename_dist <- c('dist_ref' = 'inv_dist_ref_p2',
+                 'dist_dc' = 'inv_dist_dc_p2',
+                 'dist_wrp' = 'inv_dist_wrp_p2')
+
+### Train matrices
+hourly_excl_dis_train_Xmat <- hourly_excl_dis_train %>%
+  rename(rename_dist) %>%
+  select(all_of(hourly_predictors)) %>%
+  as.matrix()
+
+hourly_full_train_Xmat <-
+  hourly_full_train %>%
+  rename(rename_dist) %>%
+  select(all_of(hourly_predictors)) %>%
+  as.matrix()
+
+daily_daha_excl_dis_train_Xmat <-
+  daily_ha_excl_dis_train %>%
+  rename(rename_dist) %>%
+  select(all_of(da_predictors)) %>%
+  as.matrix()
+
+daily_daha_full_train_Xmat <-
+  daily_ha_full_train %>%
+  rename(rename_dist) %>%
+  select(all_of(da_predictors)) %>%
+  as.matrix()
+
+daily_dmha_excl_dis_train_Xmat <-
+  daily_ha_excl_dis_train %>%
+  rename(rename_dist) %>%
+  select(all_of(dm_predictors)) %>%
+  as.matrix()
+
+daily_dmha_full_train_Xmat <-
+  daily_ha_full_train %>%
+  rename(rename_dist) %>%
+  select(all_of(dm_predictors)) %>%
+  as.matrix()
+
+### Test matrices
+hourly_excl_dis_test_Xmat <- hourly_excl_dis_test %>%
+  rename(rename_dist) %>%
+  select(all_of(hourly_predictors)) %>%
+  as.matrix()
+
+hourly_full_test_Xmat <-
+  hourly_full_test %>%
+  rename(rename_dist) %>%
+  select(all_of(hourly_predictors)) %>%
+  as.matrix()
+
+daily_daha_excl_dis_test_Xmat <-
+  daily_ha_excl_dis_test %>%
+  rename(rename_dist) %>%
+  select(all_of(da_predictors)) %>%
+  as.matrix()
+
+daily_daha_full_test_Xmat <-
+  daily_ha_full_test %>%
+  rename(rename_dist) %>%
+  select(all_of(da_predictors)) %>%
+  as.matrix()
+
+
+daily_dmha_excl_dis_test_Xmat <-
+  daily_ha_excl_dis_test %>%
+  rename(rename_dist) %>%
+  select(all_of(dm_predictors)) %>%
+  as.matrix()
+
+daily_dmha_full_test_Xmat <-
+  daily_ha_full_test %>%
+  rename(rename_dist) %>%
+  select(all_of(dm_predictors)) %>%
+  as.matrix()
+
+### Q99 matrices
+daily_dmha_full_test_for_q99_Xmat <- 
+  daily_ha_full_test %>%
+  rename(rename_dist) %>%
+  select(all_of(c(dm_predictors, 'day')))
+
+daily_dmha_full_full_for_q99_Xmat <- 
+  daily_ha_full_train %>%
+  bind_rows(daily_ha_full_test) %>%
+  rename(rename_dist) %>%
+  select(all_of(c(dm_predictors, 'day')))
+
+ha_full_full_for_q99_Xmat <- 
+  hourly_full_train %>%
+  bind_rows(hourly_full_test) %>%
+  rename(rename_dist) %>%
+  mutate(origin = as.Date("2020-01-01")) %>%
+  select(all_of(c(hourly_predictors, 'day', 'dayhour')))
+
+monitor_coord_map <- hourly_train %>% select(Monitor, mon_utm_x, mon_utm_y) %>% distinct()
+```
+
+```{r}
+######## Save some files for QXGB #######
+# write_parquet(monitor_coord_map, 'monitor_coord_map.parquet')
+# write_parquet(ha_full_full_for_q99_Xmat %>% as_tibble(), 
+#               '../rfiles/data/ha_full_full_for_py_v2.parquet')
+# write_parquet(bind_rows(hourly_full_train %>% select(H2S_hourly_avg),
+#                         hourly_full_test %>% select(H2S_hourly_avg)),
+#               '../rfiles/data/ha_full_full_y_for_py_v2.parquet')
+############
+```
+
+```{r}
+get_test_metrics <- function(model, test_mat, y_test, transformation = 'None',
+                             lag_mean = NULL){
+  y_pred <- predict(model, newdata = test_mat)
+  if (!is.null(lag_mean)) y_pred <- y_pred + lag_mean
+  R2 <- R2(y_pred, y_test)
+  RMSE <- RMSE(y_pred, y_test)
+  coef <- summary(lm(y_test ~ y_pred))$coefficients[2, 1]
+  if (transformation == 'log'){
+    BT_R2 <- R2(exp(y_pred), exp(y_test))
+    BT_RMSE <- RMSE(exp(y_pred), exp(y_test))
+    BT_coef <- summary(lm(exp(y_test) ~ exp(y_pred)))$coefficients[2, 1]
+  } else if (transformation == 'None') {
+    BT_R2 <- NA
+    BT_RMSE <- NA
+    BT_coef <- NA
+  }
+  return(list(pred = y_pred, R2 = R2, RMSE = RMSE, coef = coef, 
+              BT_R2 = BT_R2, BT_RMSE = BT_RMSE, BT_coef = BT_coef))
+}
+
+get_event_metrics <- function(disaster, y_pred, y_test, transformation = 'None'){
+  # Compute event period vs non-event period stats
+  if (!(is.null(disaster) | sum(disaster) == 0)) {
+    disaster <- as.logical(disaster)
+    event_y_pred <- y_pred[disaster]
+    event_y_test <- y_test[disaster]
+    normal_y_pred <- y_pred[!disaster]
+    normal_y_test <- y_test[!disaster]
+    
+    event_R2 <- R2(event_y_pred, event_y_test)
+    event_RMSE <- RMSE(event_y_pred, event_y_test)
+    event_coef <- summary(lm(event_y_test ~ event_y_pred))$coefficients[2, 1]
+    normal_R2 <- R2(normal_y_pred, normal_y_test)
+    normal_RMSE <- RMSE(normal_y_pred, normal_y_test)
+    normal_coef <- summary(lm(normal_y_test ~ normal_y_pred))$coefficients[2, 1]
+    
+    if (transformation == 'log'){
+      BT_event_R2 <- R2(exp(event_y_pred), exp(event_y_test))
+      BT_event_RMSE <- RMSE(exp(event_y_pred), exp(event_y_test))
+      BT_event_coef <- summary(lm(exp(event_y_test) ~ exp(event_y_pred)))$coefficients[2, 1]
+      BT_normal_R2 <- R2(exp(normal_y_pred), exp(normal_y_test))
+      BT_normal_RMSE <- RMSE(exp(normal_y_pred), exp(normal_y_test))
+      BT_normal_coef <- summary(lm(exp(normal_y_test) ~ exp(normal_y_pred)))$coefficients[2, 1]
+    } else if (transformation == 'None') {
+      BT_event_R2 <- NA
+      BT_event_RMSE <- NA
+      BT_event_coef <- NA
+      BT_normal_R2 <- NA
+      BT_normal_RMSE <- NA
+      BT_normal_coef <- NA
+    }
+    
+  } else {
+    for (met in c('R2', 'RMSE', 'coef')) {
+      for (period in c('event', 'normal')) {
+        for (t in c('', 'BT'))
+          if (t == ''){
+            assign(paste(period, met, sep='_'), NA)
+          } else {
+            assign(paste(t, period, met, sep='_'), NA)
+          }
+        
+      }
+    }
+  }
+
+  return(list(event_R2 = event_R2, event_RMSE = event_RMSE, event_coef = event_coef, 
+              normal_R2 = normal_R2, normal_RMSE = normal_RMSE, normal_coef = normal_coef,
+              BT_event_R2 = BT_event_R2, BT_event_RMSE = BT_event_RMSE, BT_event_coef = BT_event_coef,
+              BT_normal_R2 = BT_normal_R2, BT_normal_RMSE = BT_normal_RMSE, BT_normal_coef = BT_normal_coef))
+}
+
+get_val_metrics <- function(model, transformation = 'None'){
+  if (transformation == 'None') {
+    fold_stat <- model$pred %>% group_by(Resample) %>% 
+    summarise(R2 = R2(pred, obs), RMSE = RMSE(pred, obs))
+    R2 <- mean(fold_stat$R2)
+    RMSE <- mean(fold_stat$RMSE)
+    coef <- summary(lm(model$pred$obs ~ model$pred$pred))$coefficients[2, 1]
+    BT_R2 <- NA
+    BT_RMSE <- NA
+    BT_coef <- NA
+  } else if (transformation == 'log') {
+    fold_stat <- model$pred %>% group_by(Resample) %>% 
+      summarise(R2 = R2(pred, obs), RMSE = RMSE(pred, obs),
+                R2_BT = R2(exp(pred), exp(obs)), RMSE_BT = RMSE(exp(pred), exp(obs)))
+    R2 <- mean(fold_stat$R2)
+    BT_R2 <- mean(fold_stat$R2_BT)
+    RMSE <- mean(fold_stat$RMSE)
+    BT_RMSE <- mean(fold_stat$RMSE_BT)
+    coef <- summary(lm(model$pred$obs ~ model$pred$pred))$coefficients[2, 1]
+    BT_coef <- summary(lm(exp(model$pred$obs) ~ exp(model$pred$pred)))$coefficients[2, 1]
+  }
+
+  return(list(R2 = R2, RMSE = RMSE, coef = coef, 
+              BT_R2 = BT_R2, BT_RMSE = BT_RMSE, BT_coef = BT_coef))
+}
+
+get_test_result_row <- function(name, response, daterange, test_metrics, event_metrics){
+  test_metrics_row <- as_tibble_row(test_metrics[-which(names(test_metrics)=='pred')])
+  event_metrics_row <- as_tibble_row(event_metrics)
+  result <- tibble_row(Model = name, model_response_name = response, daterange = daterange,
+                       test_metrics_row, event_metrics_row)
+  return(result)
+}
+
+get_val_result_row <- function(name, response, daterange, val_metrics){
+  val_metrics_row <- as_tibble_row(val_metrics)
+  result <- tibble_row(Model = name, model_response_name = response, daterange = daterange,
+                       val_metrics_row)
+  return(result)
+}
+
+# helper to fit and summarize
+lm_label <- function(df) {
+  fit <- lm(obs ~ pred, data = df)
+  b0 <- coef(fit)[1]; b1 <- coef(fit)[2]
+  r2 <- summary(fit)$r.squared
+  rmse <- sqrt(mean((df$pred - df$obs)^2, na.rm = TRUE))
+  sprintf("y=%.2f+%.2fx, R²=%.2f, RMSE=%.2f", b0, b1, r2, rmse)
+}
+
+get_ovp_plot <- function(obs, pred, BT = FALSE,
+                         disaster = NULL, anno_y = Inf, anno_x = -Inf) {
+  if (!BT) {
+    plot_df <- tibble(obs = obs,  pred = pred)
+  } else {
+    plot_df <- tibble(obs = exp(obs),  pred = exp(pred))
+  }
+  
+  if (!is.null(disaster)) {
+    plot_df$disaster <- as.numeric(disaster)
+  } else {
+    plot_df$disaster <- 0
+  }
+  
+  plot <- ggplot(plot_df, aes(x = pred, y = obs, color = factor(disaster)))
+  
+  if (is.null(disaster)) {
+    # Get label
+    lab_txt <- lm_label(plot_df)
+    label_df <- tibble(x = -Inf, y = Inf, lab = lab_txt)
+  } else {
+    lab_txt_all <- lm_label(plot_df)
+    lab_txt_event <- lm_label(plot_df %>% filter(disaster == 1))
+    lab_txt_routine <- lm_label(plot_df %>% filter(disaster == 0))
+    lab_txt <- str_glue("All: {lab_txt_all}\nRoutine: {lab_txt_routine}\nEvent: {lab_txt_event}")
+  }
+  
+  plot <- plot +
+    geom_point(alpha = 0.9, show.legend = FALSE) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    geom_smooth(aes(group = 1), method = "lm", se = FALSE, color = "black") +
+    scale_color_manual(values = c(`0` = "dodgerblue", `1` = "tomato")) +
+    labs(y = 'Observed (ppb)', x = 'Predicted (ppb)') +
+    annotate(
+      "label",
+      x = -Inf, y = Inf,
+      hjust = 0, vjust = 1,
+      label = lab_txt,
+      size = 4,
+      fill = "white",
+      color = "black",
+      label.size = 0,      
+      alpha = 0.85
+    ) +
+    theme_bw()
+  
+  return(plot)
+}
+```
+
+```{r}
+get_response_base_name <- function(response) {
+  if (str_detect(response, 'daha')) {
+    return('H2S_daily_avg_from_hourly_avg')
+  } else if (str_detect(response, 'dmha')) {
+    return('H2S_daily_max_from_hourly_avg')
+  } else if (str_detect(response, 'ha')) {
+    return('H2S_hourly_avg')
+  }
+}
+
+get_observed <- function(data, 
+                         response = c('daha', 'dmha', 'ha',
+                                      'daha_log', 'dmha_log', 'ha_log')) {
+  obs <- data %>% pull(get_response_base_name(response))
+  
+  if (str_detect(response, 'log')) {
+    obs <- log(obs)
+  }
+  
+  return(obs)
+}
+
+# For 80/20 tests with new variables but existing hyperparameter tunings.
+compute_weights <- function(y_train, weight_q = 0.95, weight_max = 10){
+  # Compute weights: Weight obs above 95th-percentile higher
+  # weight_q = 0.95, weight_max = 20
+  q    <- quantile(y_train, weight_q, na.rm = TRUE)
+  ymax <- max(y_train, na.rm = TRUE)
+  den  <- ymax - q
+  w <- 1 + (weight_max - 1) * pmin(1, pmax(0, (y_train - q) / den))
+  return(w)
+}
+
+fit_new_8020 <- function(model, X_train, y_train, 
+                         weight_q = 0.95, weight_max = 10){
+  # y_train should be already transformed
+  
+  # Compute weights
+  w <- compute_weights(y_train, weight_q, weight_max)  
+  
+  # Get design matrix
+  dtrain <- xgb.DMatrix(X_train, label = y_train, weight = w)
+  
+  set.seed(42)
+  new_model <- xgb.train(
+    params = as.list(model$bestTune[names(model$bestTune) != 'nrounds']),
+    data = dtrain,
+    nrounds = model$bestTune$nrounds,
+    watchlist = list(train = dtrain),
+    verbose = 0
+  )
+  
+  return(new_model)
+}
+
+
+control_single <- trainControl(
+  method = "none",
+  verboseIter=TRUE
+)
+
+get_predictors <- function(response, lag = FALSE) {
+  response_base <- str_replace(response, '_log', '')
+  
+  if (response_base == 'daha') {
+    predictors <- da_predictors
+  } else if (response_base == 'dmha') {
+    predictors <- dm_predictors
+  } else if (response_base == 'ha') {
+    predictors <- hourly_predictors
+  }
+  
+  if (lag == TRUE) predictors <- c(predictors, 'mean')
+  
+  return(predictors)
+}
+
+# Spatial Cross Validation
+spatial_validation <- function(model, 
+                               data, 
+                               name,
+                               response = c('daha', 'dmha', 'ha',
+                                            'daha_log', 'dmha_log', 'ha_log'),
+                               daterange,
+                               lag = FALSE,
+                               weight_q = 0.95,
+                               weight_max = 10) {
+  data <- data %>%
+    rename(rename_dist)
+  
+  # Remove Chico
+  data <- data %>% filter(Monitor != 'Chico')
+  
+  response_name <- get_response_base_name(response)
+  transformation <- ifelse(str_detect(response, 'log'), 'log', 'None')
+  
+  predictors <- get_predictors(response, lag)
+  
+  # Data should be the whole data set for the model
+  cv_table <- tibble(
+    Model = character(),
+    model_response_name = character(),
+    daterange = character(),
+    Monitor = character(),
+    "R2" = numeric(),
+    "RMSE" = numeric(),
+    "coef" = numeric(),
+    "event_R2" = numeric(),
+    "event_RMSE" = numeric(),
+    "event_coef" = numeric(),
+    "normal_R2" = numeric(),
+    "normal_RMSE" = numeric(),
+    "normal_coef" = numeric()
+  )
+  cv_plots <- list()
+  monitors <- unique(data$Monitor)
+  for (monitor in monitors) {
+    print(str_glue("Running LOSO model: leaving out {monitor}..."))
+    # Prep the data sets (Leave-one-monitor out)
+    train <- data %>% filter(Monitor != monitor)
+    test <- data %>% filter(Monitor == monitor)
+    
+    # Y(s)
+    y_train <- get_observed(train, response)
+    y_test <- get_observed(test, response)
+      
+    if (lag == TRUE){
+      # Add the mean response of the k-1 monitors as a predictor
+      # Compute daily means Y(s') or hourly means
+      if (response %in% c('ha', 'ha_log')) {
+        means <- train %>%
+          mutate(response = if (transformation == 'log') 
+            log(.data[[response_name]]) else .data[[response_name]]) %>%
+          group_by(dayhour) %>%
+          summarise(mean = mean(response))
+        train <- train %>%
+          left_join(means, join_by(dayhour))
+        test <- test %>%
+          left_join(means, join_by(dayhour))
+      } else {
+        means <- train %>%
+          mutate(response = if (transformation == 'log') 
+            log(.data[[response_name]]) else .data[[response_name]]) %>%
+          group_by(day) %>%
+          summarise(mean = mean(response))
+        train <- train %>%
+          left_join(means, join_by(day))
+        test <- test %>%
+          left_join(means, join_by(day))
+      }
+      
+      X_train <- train %>% select(all_of(predictors)) %>%
+        mutate(mean = coalesce(mean, 0)) %>%
+        as.matrix()
+      X_test <- test %>% select(all_of(predictors)) %>%
+        mutate(mean = coalesce(mean, 0)) %>%
+        as.matrix()
+    
+      # Then, target is Y(s)-Y(s') instead of Y(s)
+      # XGBoost implementation
+      y_train <- y_train-X_train[,'mean']
+      # y_test <- y_test-X_test[,'mean']
+      # Below is used for caret
+      # train <- X_train %>% mutate(response = y_train-mean)
+      # test <- X_test %>% mutate(response = y_test-mean)
+      
+      # Compute weights on lagged scale (high deviation -> high weight)
+      w <- compute_weights(y_train, weight_q, weight_max)  
+    } else {
+      X_train <- train %>% select(all_of(predictors)) %>% as.matrix()
+      X_test <- test %>% select(all_of(predictors)) %>% as.matrix()
+      # Below is used for caret
+      # train <- X_train %>% mutate(response = y_train)
+      # test <- X_test %>% mutate(response = y_test)
+      
+      # Compute weights on original scale
+      w <- compute_weights(y_train, weight_q, weight_max)  
+    }
+    
+    # Get design matrix
+    dtrain <- xgb.DMatrix(X_train, label = y_train, weight = w)
+    
+    set.seed(42)
+    # Fit model without this site with xgboost + weight
+    lomo_model <- xgb.train(
+      params = as.list(model$bestTune[names(model$bestTune) != 'nrounds']),
+      data = dtrain,
+      nrounds = model$bestTune$nrounds,
+      watchlist = list(train = dtrain),
+      verbose = 0
+    )
+    
+    # Fit model without this site with caret
+    # lomo_model <- train(response~.,
+    #                            method = 'xgbTree',
+    #                            data = train,
+    #                            trControl = control_single,
+    #                            tuneGrid = model$bestTune,
+    #                            importance=TRUE, 
+    #                            verbosity = 0, 
+    #                            verbose=FALSE)
+    
+    # Get testing metrics on the left out site
+    if (lag) lag_mean <- X_test[,'mean'] else lag_mean <- NULL
+    test_metrics <- 
+      get_test_metrics(lomo_model, X_test, y_test, transformation = transformation,
+                       lag_mean = lag_mean)
+    
+    y_test_pred <- test_metrics$pred
+  
+    disaster_idx <- test$year == 2021 & test$month %in% 10:12
+    event_metrics <- get_event_metrics(disaster_idx, y_test_pred, y_test, transformation)
+    
+    if (transformation == 'log') {
+      test_metrics <- test_metrics[str_detect(names(test_metrics), 'BT')]
+      names(test_metrics) <- str_replace(names(test_metrics), 'BT_', '')
+      event_metrics <- event_metrics[str_detect(names(event_metrics), 'BT')]
+      names(event_metrics) <- str_replace(names(event_metrics), 'BT_', '')
+      
+    } else {
+      test_metrics <- test_metrics[!str_detect(names(test_metrics), 'BT')]
+      event_metrics <- event_metrics[!str_detect(names(event_metrics), 'BT')]
+    }
+    
+    if (sum(disaster_idx) == 0) disaster_idx <- NULL
+    plot <- get_ovp_plot(y_test, y_test_pred, BT = transformation == 'log',
+                         disaster = disaster_idx)
+    
+    plot <- plot +
+      labs(title = paste0('Left out monitor: ', monitor))
+    
+    cv_plots[[monitor]] <- plot
+    
+    test_metrics_row <- as_tibble_row(test_metrics[c('R2', 'RMSE', 'coef')])
+    event_metrics_row <- as_tibble_row(event_metrics)
+    row <- tibble_row(Model = name, model_response_name = response, daterange = daterange,
+                      test_metrics_row, event_metrics_row, Monitor = monitor)
+    cv_table <- cv_table %>%
+      add_row(row)
+  }
+  
+  result <- list(cv_table = cv_table, cv_plots = cv_plots)
+  return(result)
+}
+
+temporal_validation <- function(model, 
+                               data, 
+                               name,
+                               response = c('daha', 'dmha', 'ha',
+                                            'daha_log', 'dmha_log', 'ha_log'),
+                               daterange,
+                               weight_q = 0.95,
+                               weight_max = 10) {
+  data <- data %>%
+    rename(rename_dist)
+  
+  response_name <- get_response_base_name(response)
+  transformation <- ifelse(str_detect(response, 'log'), 'log', 'None')
+  
+  # Remove July/Aug 2021 for training
+  train <- data %>% filter(!(year==2021 & month %in% 7:8)) 
+  test <- data %>% filter(year==2021 & month %in% 7:8)
+  
+  y_train <- get_observed(train, response)
+  y_test <- get_observed(test, response)
+  
+  # Compute weights on non-lagged scale
+  w <- compute_weights(y_train, weight_q, weight_max)  
+    
+  # Select predictors
+  predictors <- get_predictors(response)
+  X_train <- train %>% select(all_of(predictors)) %>% as.matrix()
+  X_test <- test %>% select(all_of(predictors)) %>% as.matrix()
+  
+  # Below is for xgboost implementation
+  # Get design matrix
+  dtrain <- xgb.DMatrix(X_train, label = y_train, weight = w)
+
+  set.seed(42)
+  # Fit model without this site with xgboost + weight
+  loeo_model <- xgb.train(
+    params = as.list(model$bestTune[names(model$bestTune) != 'nrounds']),
+    data = dtrain,
+    nrounds = model$bestTune$nrounds,
+    watchlist = list(train = dtrain),
+    verbose = 0
+  )
+    
+  # Below is for caret implementation
+  # train <- X_train %>% mutate(response = y_train)
+  # test <- X_test %>% mutate(response = y_test)
+  # 
+  # # Fit model without the small event
+  # loeo_model <- train(response~.,
+  #                     method = 'xgbTree',
+  #                     data = train,
+  #                     trControl = control_single,
+  #                     tuneGrid = model$bestTune,
+  #                     importance=TRUE, 
+  #                     verbosity = 0, 
+  #                     verbose=FALSE)
+  
+  # Get testing metrics on the left out site
+  test_metrics <- 
+    get_test_metrics(loeo_model, X_test, y_test, transformation = transformation)
+  
+  y_test_pred <- test_metrics$pred
+  
+  if (transformation == 'log') {
+    test_metrics <- test_metrics[str_detect(names(test_metrics), 'BT')]
+    names(test_metrics) <- str_replace(names(test_metrics), 'BT_', '')
+  } else {
+    test_metrics <- test_metrics[!str_detect(names(test_metrics), 'BT')]
+  }
+  
+  plot <- get_ovp_plot(y_test, y_test_pred, BT = transformation == 'log')
+  
+  test_metrics_row <- as_tibble_row(test_metrics[c('R2', 'RMSE', 'coef')])
+  row <- tibble_row(Model = name, model_response_name = response, daterange = daterange,
+                    test_metrics_row)
+  
+  return(list(result = row, plot = plot))
+}
+
+fit_final_model <- function(model, 
+                            data, 
+                            response = c('daha_log', 'dmha_log')) {
+  data <- data %>%
+    rename(rename_dist)
+  
+  response_name <- get_response_base_name(response)
+  transformation <- ifelse(str_detect(response, 'log'), 'log', 'None')
+  
+  predictors <- get_predictors(response, lag = TRUE)
+  
+  # Data should be the whole data set for the model
+
+  # Prep the data sets
+  train <- data
+  
+  # Y(s)
+  y_train <- get_observed(train, response)
+    
+  # ADD LAG
+  # Add the mean response of the k-1 monitors as a predictor
+  # Compute daily means Y(s') or hourly means
+  if (response %in% c('ha', 'ha_log')) {
+    means <- train %>%
+      mutate(response = if (transformation == 'log') 
+        log(.data[[response_name]]) else .data[[response_name]]) %>%
+      group_by(dayhour) %>%
+      summarise(mean = mean(response))
+    train <- train %>%
+      left_join(means, join_by(dayhour))
+  } else {
+    means <- train %>%
+      mutate(response = if (transformation == 'log') 
+        log(.data[[response_name]]) else .data[[response_name]]) %>%
+      group_by(day) %>%
+      summarise(mean = mean(response))
+    train <- train %>%
+      left_join(means, join_by(day))
+  }
+  
+  X_train <- train %>% select(all_of(predictors)) %>%
+    mutate(mean = coalesce(mean, 0)) %>%
+    as.matrix()
+
+  # Then, target is Y(s)-Y(s') instead of Y(s)
+  # XGBoost implementation
+  y_train <- y_train-X_train[,'mean']
+  
+  # Get design matrix
+  dtrain <- xgb.DMatrix(X_train, label = y_train)
+  
+  set.seed(42)
+  # Fit model without this site with xgboost + weight
+  final_model <- xgb.train(
+    params = as.list(model$bestTune[names(model$bestTune) != 'nrounds']),
+    data = dtrain,
+    nrounds = model$bestTune$nrounds,
+    watchlist = list(train = dtrain),
+    verbose = 0
+  )
+
+  return(final_model)
+}
+```
+
+```{r}
+get_curr_data <- function(response = c('daha', 'dmha', 'ha',
+                                       'daha_log', 'dmha_log', 'ha_log'), 
+                          daterange = c('excl_dis', 'full_unstrat')){
+  
+  daterange <- str_replace(daterange, '_unstrat', '')
+  transformation <- ifelse(str_detect(response, 'log'), 'log', 'None')
+  response_base <- str_replace(response, '_log', '')
+  
+  # Get X
+  if (response_base == 'ha') {
+    X_train <- get(paste('hourly', daterange, 'train', 'Xmat', sep = '_'))
+    X_test <- get(paste('hourly', daterange, 'test', 'Xmat', sep = '_'))
+  } else {
+    X_train <- get(paste('daily', response_base, daterange, 'train', 'Xmat', sep = '_'))
+    X_test <- get(paste('daily', response_base, daterange, 'test', 'Xmat', sep = '_'))
+  }
+  
+  
+  # Get y
+  response_colname <- get_response_base_name(response)
+  y_train <- get_data(response_colname, daterange, 'train') %>%
+    pull(response_colname)
+  y_test <- get_data(response_colname, daterange, 'test') %>%
+    pull(response_colname)
+  
+  if (transformation == 'log') {
+    y_train <- log(y_train)
+    y_test <- log(y_test)
+  }
+  return(list(X_train = X_train, X_test = X_test, y_train = y_train, y_test = y_test))
+}
+
+get_fi_names <- function(response) {
+  response_base <- str_replace(response, '_log', '')
+  response_names <- get(paste0(response_base, '_', 'names'))
+  full_names <- c(fixed_names, response_names)
+  return(full_names)
+}
+
+get_fi_plot <- function(model, names, nfeatures = 15){
+  # This is for caret
+  # imp<-varImp(model,scale=FALSE)
+  
+  # This is for xgb.Booster
+  imp <- xgb.importance(model = model)
+  
+  # rename variables
+  imp$Feature <- ifelse(
+    imp$Feature %in% unname(names),
+    names(names)[match(imp$Feature, unname(names))],
+    imp$Feature
+  )
+
+  imp <- tibble(variable = imp$Feature, importance = imp$Gain)
+  
+  plot <- imp %>%
+    top_n(nfeatures, importance) %>%
+    ggplot(aes(x=reorder(variable, importance), y=importance)) + 
+    geom_point() +
+    geom_segment(aes(x=variable,xend=variable,y=0,yend=importance)) +
+    coord_flip() +
+    theme_light() +
+    theme(axis.text.y = element_text(size = 10),
+          axis.title.x=element_blank(),
+          axis.title.y=element_blank())
+  return(plot)
+}
+
+get_test_dis_idx <- function(response, daterange) {
+  daterange <- str_replace(daterange, '_unstrat', '')
+  response_colname <- get_response_base_name(response)
+  data <- get_data(response_colname, daterange, 'test')
+  disaster_idx <- data$year == 2021 & data$month %in% 10:12
+  if (sum(disaster_idx) == 0) disaster_idx <- NULL
+  return(disaster_idx)
+}
+```
+
+
+
+## DAHA {.tabset .tabset-pills}
+```{r}
+response <- 'daha'
+transformation <- ifelse(str_detect(response, 'log'), 'log', 'None')
+```
+
+### Exclude Event {.tabset .tabset-pills} 
+#### 80/20 test
+```{r echo = T, results = 'hide'}
+daterange <- 'excl_dis'
+filename <- paste0('fit.xgb_', response, '_', daterange, '.rds')
+assign(paste0('fit.xgb_', response, '_', daterange), readRDS(paste0(model_folder, filename)))
+paste0('fit.xgb_', response, '_', daterange)
+```
+
+```{r}
+v8020_weight_max <- 1
+curr_model <- get(paste0('fit.xgb_', response, '_', daterange))
+curr_data <- get_curr_data(response, daterange)
+curr_X_train <- curr_data$X_train; curr_y_train <- curr_data$y_train
+curr_X_test <- curr_data$X_test; curr_y_test <- curr_data$y_test
+# Get new model (new variables + weight)
+new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v8020_weight_max)
+```
+
+```{r}
+# Feature importance of new model
+get_fi_plot(new_model, get_fi_names(response))
+ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
+```
+
+```{r}
+test_metrics <- get_test_metrics(new_model, 
+                                 curr_X_test,
+                                 curr_y_test,
+                                 transformation)
+test_pred <- test_metrics$pred
+disaster_idx <- get_test_dis_idx(response, daterange)
+event_metrics <- get_event_metrics(disaster_idx, test_pred, curr_y_test, transformation)
+```
+
+```{r}
+assign(paste(response, daterange, "ovp", sep = '_'),  
+       get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
+                                       disaster_idx))
+get(paste(response, daterange, "ovp", sep = '_'))
+ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
+  response_base <- str_replace(response, '_log', '')
+  lim <- case_when(response_base == 'daha' ~ 4,
+                    response_base == 'dmha' ~ 10,
+                    response_base == 'ha' ~ 10,
+                    .default = 4)
+  assign(paste(response, daterange, "subset", lim, "ovp", sep = '_'),  
+         get(paste(response, daterange, "ovp", sep = '_')) + 
+           coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
+  print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
+  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
+}
+```
+
+
+```{r}
+test_result <- test_result %>%
+  add_row(get_test_result_row('Exclude Event', response, daterange,
+                              test_metrics, event_metrics))
+
+negative_pred <- negative_pred %>%
+  add_row(tibble_row(Model = 'Exclude Event', 
+                     model_response_name = response, 
+                     daterange = daterange,
+                     'negative' = sum(test_pred < 0)))
+```
+
+#### Leave-one-out spatial tests {.tabset .tabset-pills}
+##### With Lag
+
+```{r}
+data <- bind_rows(daily_ha_excl_dis_train, daily_ha_excl_dis_test)
+lag_weight_max <- 1
+# spatial_cv <- spatial_validation(curr_model, data, 'Exclude Event',
+# response, daterange, lag = TRUE, weight_max = lag_weight_max)
+#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv$cv_table
+```
+
+```{r}
+for (i in seq_along(spatial_cv$cv_plots)) {
+  print(spatial_cv$cv_plots[[i]])
+}
+```
+
+```{r, eval = TRUE}
+p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
+ggsave(
+  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
+  plot = p,
+  width = 15, height = 15, dpi = 300
+)
+```
+
+```{r}
+spatial_avg_result <- spatial_cv$cv_table %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_avg_result <- spatial_avg_result %>% 
+  select(where(~is.numeric(.x))) %>% 
+  colMeans(na.rm=TRUE)
+
+spatial_test_result <- spatial_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Exclude Event',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_avg_result)))
+spatial_avg_result
+```
+
+```{r}
+w <- data %>%
+  group_by(Monitor) %>%
+  summarise(n = n())
+spatial_table_w <- spatial_cv$cv_table %>%
+  left_join(w, join_by("Monitor"))
+
+spatial_table_w <- spatial_table_w %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_weighted_avg_result <- spatial_table_w %>% 
+  select(where(~is.numeric(.x))) %>% 
+  summarise(across(!all_of("n") , ~ weighted.mean(.x, n, na.rm = TRUE)))
+
+spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Exclude Event',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_weighted_avg_result%>%unlist())))
+
+spatial_weighted_avg_result
+```
+
+
+#### Leave-one-out temporal test
+```{r}
+temporal_weight_max <- 1
+# temporal_test <- temporal_validation(curr_model, data, 'Exclude Event',
+                                     # response, daterange, weight_max = temporal_weight_max)
+
+# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+
+temporal_test_result <- temporal_test_result %>%
+  add_row(temporal_test$result)
+
+temporal_test$result
+```
+
+```{r}
+temporal_test$plot
+ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+
+### Everything w.o Disaster Indicator {.tabset .tabset-pills}
+#### 80/20 test
+```{r echo = T, results = 'hide'}
+daterange <- 'full_unstrat'
+filename <- paste0('fit.xgb_', response, '_', daterange, '.rds')
+assign(paste0('fit.xgb_', response, '_', daterange), readRDS(paste0(model_folder, filename)))
+paste0('fit.xgb_', response, '_', daterange)
+```
+```{r}
+curr_model <- get(paste0('fit.xgb_', response, '_', daterange))
+curr_data <- get_curr_data(response, daterange)
+curr_X_train <- curr_data$X_train; curr_y_train <- curr_data$y_train
+curr_X_test <- curr_data$X_test; curr_y_test <- curr_data$y_test
+# Get new model (new variables + weight)
+new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v8020_weight_max)
+```
+
+```{r}
+# Feature importance of new model
+get_fi_plot(new_model, get_fi_names(response))
+ggsave(paste0(fi_folder, daterange, '_', response,  '_wgt', v8020_weight_max, '_fi.png'), width = 20, height = 12, units = "cm")
+```
+
+```{r}
+test_metrics <- get_test_metrics(new_model, 
+                                 curr_X_test,
+                                 curr_y_test,
+                                 transformation)
+test_pred <- test_metrics$pred
+disaster_idx <- get_test_dis_idx(response, daterange)
+event_metrics <- get_event_metrics(disaster_idx, test_pred, curr_y_test, transformation)
+```
+
+```{r}
+assign(paste(response, daterange, "ovp", sep = '_'),  
+       get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
+                                       disaster_idx))
+get(paste(response, daterange, "ovp", sep = '_'))
+ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
+  response_base <- str_replace(response, '_log', '')
+  lim <- case_when(response_base == 'daha' ~ 4,
+                    response_base == 'dmha' ~ 10,
+                    response_base == 'ha' ~ 10,
+                    .default = 4)
+  assign(paste(response, daterange, "subset", lim, "ovp", sep = '_'),  
+         get(paste(response, daterange, "ovp", sep = '_')) + 
+           coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
+  print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
+  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
+}
+```
+
+```{r}
+test_result_unstrat <- test_result_unstrat %>%
+  add_row(get_test_result_row('Everything w.o Event Indicator', response, daterange,
+                              test_metrics, event_metrics))
+
+negative_pred <- negative_pred %>%
+  add_row(tibble_row(Model = 'Everything w.o Event Indicator', 
+                     model_response_name = response, 
+                     daterange = daterange,
+                     'negative' = sum(test_pred < 0)))
+```
+
+#### Leave-one-out spatial tests {.tabset .tabset-pills}
+##### With Lag
+
+```{r}
+data <- bind_rows(daily_ha_full_train, daily_ha_full_test)
+# spatial_cv <- spatial_validation(curr_model, data, 'Everything w.o Event Indicator',
+# response, daterange, lag = TRUE, weight_max = lag_weight_max)
+#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv$cv_table
+```
+
+```{r}
+for (i in seq_along(spatial_cv$cv_plots)) {
+  print(spatial_cv$cv_plots[[i]])
+}
+```
+
+```{r, eval = TRUE}
+p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
+ggsave(
+  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
+  plot = p,
+  width = 15, height = 15, dpi = 300
+)
+```
+
+```{r}
+spatial_avg_result <- spatial_cv$cv_table %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_avg_result <- spatial_avg_result %>% 
+  select(where(~is.numeric(.x))) %>% 
+  colMeans(na.rm=TRUE)
+
+spatial_test_result <- spatial_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Everything w.o Event Indicator',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_avg_result)))
+spatial_avg_result
+```
+
+```{r}
+w <- data %>%
+  group_by(Monitor) %>%
+  summarise(n = n())
+spatial_table_w <- spatial_cv$cv_table %>%
+  left_join(w, join_by("Monitor"))
+
+spatial_table_w <- spatial_table_w %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_weighted_avg_result <- spatial_table_w %>% 
+  select(where(~is.numeric(.x))) %>% 
+  summarise(across(!all_of("n") , ~ weighted.mean(.x, n, na.rm = TRUE)))
+
+spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Everything w.o Event Indicator',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_weighted_avg_result%>%unlist())))
+
+spatial_weighted_avg_result
+```
+
+#### Leave-one-out temporal test
+```{r}
+# temporal_test <- temporal_validation(curr_model, data, 'Everything w.o Event Indicator',
+                                     # response, daterange, weight_max = temporal_weight_max)
+
+# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+
+temporal_test_result <- temporal_test_result %>%
+  add_row(temporal_test$result)
+
+temporal_test$result
+```
+
+```{r}
+temporal_test$plot
+ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+## Log DAHA {.tabset .tabset-pills}
+```{r}
+response <- 'daha_log'
+transformation <- ifelse(str_detect(response, 'log'), 'log', 'None')
+```
+
+### Exclude Event {.tabset .tabset-pills}
+#### 80/20 test
+```{r}
+daterange <- 'excl_dis'
+filename <- paste0('fit.xgb_', response, '_', daterange, '.rds')
+assign(paste0('fit.xgb_', response, '_', daterange), readRDS(paste0(model_folder, filename)))
+paste0('fit.xgb_', response, '_', daterange)
+```
+
+```{r}
+curr_model <- get(paste0('fit.xgb_', response, '_', daterange))
+curr_data <- get_curr_data(response, daterange)
+curr_X_train <- curr_data$X_train; curr_y_train <- curr_data$y_train
+curr_X_test <- curr_data$X_test; curr_y_test <- curr_data$y_test
+# Get new model (new variables + weight)
+new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v8020_weight_max)
+```
+
+```{r}
+# Feature importance of new model
+get_fi_plot(new_model, get_fi_names(response))
+ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
+```
+
+```{r}
+test_metrics <- get_test_metrics(new_model, 
+                                 curr_X_test,
+                                 curr_y_test,
+                                 transformation)
+test_pred <- test_metrics$pred
+disaster_idx <- get_test_dis_idx(response, daterange)
+event_metrics <- get_event_metrics(disaster_idx, test_pred, curr_y_test, transformation)
+```
+
+```{r}
+assign(paste(response, daterange, "ovp", sep = '_'),  
+       get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
+                                       disaster_idx))
+get(paste(response, daterange, "ovp", sep = '_'))
+ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
+  response_base <- str_replace(response, '_log', '')
+  lim <- case_when(response_base == 'daha' ~ 4,
+                    response_base == 'dmha' ~ 10,
+                    response_base == 'ha' ~ 10,
+                    .default = 4)
+  assign(paste(response, daterange, "subset", lim, "ovp", sep = '_'),  
+         get(paste(response, daterange, "ovp", sep = '_')) + 
+           coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
+  print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
+  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
+}
+```
+
+
+```{r}
+test_result_unstrat <- test_result_unstrat %>%
+  add_row(get_test_result_row('Exclude Event', response, daterange,
+                              test_metrics, event_metrics))
+
+negative_pred <- negative_pred %>%
+  add_row(tibble_row(Model = 'Exclude Event', 
+                     model_response_name = response, 
+                     daterange = daterange,
+                     'negative' = sum(test_pred < 0)))
+```
+
+#### Leave-one-out spatial tests {.tabset .tabset-pills}
+##### With Lag
+
+```{r}
+data <- bind_rows(daily_ha_excl_dis_train, daily_ha_excl_dis_test)
+# spatial_cv <- spatial_validation(curr_model, data, 'Exclude Event',
+# response, daterange, lag = TRUE, weight_max = lag_weight_max)
+#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv$cv_table
+```
+
+```{r}
+for (i in seq_along(spatial_cv$cv_plots)) {
+  print(spatial_cv$cv_plots[[i]])
+}
+```
+
+```{r, eval = TRUE}
+p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
+ggsave(
+  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
+  plot = p,
+  width = 15, height = 15, dpi = 300
+)
+```
+
+```{r}
+spatial_avg_result <- spatial_cv$cv_table %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_avg_result <- spatial_avg_result %>% 
+  select(where(~is.numeric(.x))) %>% 
+  colMeans(na.rm=TRUE)
+
+spatial_test_result <- spatial_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Exclude Event',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_avg_result)))
+spatial_avg_result
+```
+
+```{r}
+w <- data %>%
+  group_by(Monitor) %>%
+  summarise(n = n())
+spatial_table_w <- spatial_cv$cv_table %>%
+  left_join(w, join_by("Monitor"))
+
+spatial_table_w <- spatial_table_w %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_weighted_avg_result <- spatial_table_w %>% 
+  select(where(~is.numeric(.x))) %>% 
+  summarise(across(!all_of("n") , ~ weighted.mean(.x, n, na.rm = TRUE)))
+
+spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Exclude Event',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_weighted_avg_result%>%unlist())))
+
+spatial_weighted_avg_result
+```
+
+#### Leave-one-out temporal test
+```{r}
+# temporal_test <- temporal_validation(curr_model, data, 'Exclude Event',
+                                     # response, daterange, weight_max = temporal_weight_max)
+
+# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+
+temporal_test_result <- temporal_test_result %>%
+  add_row(temporal_test$result)
+
+temporal_test$result
+```
+
+```{r}
+temporal_test$plot
+ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+### Everything w.o Disaster Indicator {.tabset .tabset-pills}
+#### 80/20 test
+```{r echo = T, results = 'hide'}
+daterange <- 'full_unstrat'
+filename <- paste0('fit.xgb_', response, '_', daterange, '.rds')
+assign(paste0('fit.xgb_', response, '_', daterange), readRDS(paste0(model_folder, filename)))
+paste0('fit.xgb_', response, '_', daterange)
+```
+
+```{r}
+curr_model <- get(paste0('fit.xgb_', response, '_', daterange))
+curr_data <- get_curr_data(response, daterange)
+curr_X_train <- curr_data$X_train; curr_y_train <- curr_data$y_train
+curr_X_test <- curr_data$X_test; curr_y_test <- curr_data$y_test
+# Get new model (new variables + weight)
+new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v8020_weight_max)
+```
+
+```{r}
+# Feature importance of new model
+get_fi_plot(new_model, get_fi_names(response))
+#fi1 <- get_fi_plot(new_model, get_fi_names(response))
+ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
+```
+
+```{r}
+test_metrics <- get_test_metrics(new_model, 
+                                 curr_X_test,
+                                 curr_y_test,
+                                 transformation)
+test_pred <- test_metrics$pred
+disaster_idx <- get_test_dis_idx(response, daterange)
+event_metrics <- get_event_metrics(disaster_idx, test_pred, curr_y_test, transformation)
+```
+
+```{r}
+assign(paste(response, daterange, "ovp", sep = '_'),  
+       get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
+                                       disaster_idx))
+get(paste(response, daterange, "ovp", sep = '_'))
+ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
+  response_base <- str_replace(response, '_log', '')
+  lim <- case_when(response_base == 'daha' ~ 4,
+                    response_base == 'dmha' ~ 10,
+                    response_base == 'ha' ~ 10,
+                    .default = 4)
+  assign(paste(response, daterange, "subset", lim, "ovp", sep = '_'),  
+         get(paste(response, daterange, "ovp", sep = '_')) + 
+           coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
+  print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
+  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
+}
+```
+
+
+```{r}
+test_result_unstrat <- test_result_unstrat %>%
+  add_row(get_test_result_row('Everything w.o Event Indicator', response, daterange,
+                              test_metrics, event_metrics))
+```
+
+#### Leave-one-out spatial tests {.tabset .tabset-pills}
+##### With Lag
+
+```{r}
+data <- bind_rows(daily_ha_full_train, daily_ha_full_test)
+# spatial_cv <- spatial_validation(curr_model, data, 'Everything w.o Event Indicator',
+# response, daterange, lag = TRUE, weight_max = lag_weight_max)
+#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv$cv_table
+```
+
+```{r}
+for (i in seq_along(spatial_cv$cv_plots)) {
+  print(spatial_cv$cv_plots[[i]])
+}
+```
+
+```{r, eval = TRUE}
+p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
+ggsave(
+  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
+  plot = p,
+  width = 15, height = 15, dpi = 300
+)
+```
+
+```{r}
+spatial_avg_result <- spatial_cv$cv_table %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_avg_result <- spatial_avg_result %>% 
+  select(where(~is.numeric(.x))) %>% 
+  colMeans(na.rm=TRUE)
+
+spatial_test_result <- spatial_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Everything w.o Event Indicator',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_avg_result)))
+spatial_avg_result
+```
+
+```{r}
+w <- data %>%
+  group_by(Monitor) %>%
+  summarise(n = n())
+spatial_table_w <- spatial_cv$cv_table %>%
+  left_join(w, join_by("Monitor"))
+
+spatial_table_w <- spatial_table_w %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_weighted_avg_result <- spatial_table_w %>% 
+  select(where(~is.numeric(.x))) %>% 
+  summarise(across(!all_of("n") , ~ weighted.mean(.x, n, na.rm = TRUE)))
+
+spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Everything w.o Event Indicator',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_weighted_avg_result%>%unlist())))
+
+spatial_weighted_avg_result
+```
+
+#### Leave-one-out temporal test
+```{r}
+# temporal_test <- temporal_validation(curr_model, data, 'Everything w.o Event Indicator',
+                                     # response, daterange, weight_max = temporal_weight_max)
+
+# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+
+temporal_test_result <- temporal_test_result %>%
+  add_row(temporal_test$result)
+
+temporal_test$result
+```
+
+```{r}
+temporal_test$plot
+ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+daha_log_full_loeo_plot <- temporal_test$plot
+```
+
+#### Fit final model
+```{r}
+log_daha_full_xgb <- fit_final_model(curr_model, data, response)
+saveRDS(log_daha_full_xgb, paste0(model_folder, 'log_daha_full_final.rds'))
+```
+
+```{r}
+# Save the daily lags
+daily_lag <- data %>%
+  group_by(day) %>%
+  summarise(avg_da = mean(H2S_daily_avg_from_hourly_avg),
+            avg_dm = mean(H2S_daily_max_from_hourly_avg),
+            avg_log_da = mean(log(H2S_daily_avg_from_hourly_avg)),
+            avg_log_dm = mean(log(H2S_daily_max_from_hourly_avg)))
+saveRDS(daily_lag, '../rfiles/data/daily_lag.rds')
+```
+
+
+## DMHA {.tabset .tabset-pills}
+```{r}
+response <- 'dmha'
+transformation <- ifelse(str_detect(response, 'log'), 'log', 'None')
+```
+
+### Exclude Event {.tabset .tabset-pills}
+#### 80/20 test
+```{r echo = T, results = 'hide'}
+daterange <- 'excl_dis'
+filename <- paste0('fit.xgb_', response, '_', daterange, '.rds')
+assign(paste0('fit.xgb_', response, '_', daterange), readRDS(paste0(model_folder, filename)))
+paste0('fit.xgb_', response, '_', daterange)
+```
+
+```{r}
+curr_model <- get(paste0('fit.xgb_', response, '_', daterange))
+curr_data <- get_curr_data(response, daterange)
+curr_X_train <- curr_data$X_train; curr_y_train <- curr_data$y_train
+curr_X_test <- curr_data$X_test; curr_y_test <- curr_data$y_test
+# Get new model (new variables + weight)
+new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v8020_weight_max)
+```
+
+```{r}
+# Feature importance of new model
+get_fi_plot(new_model, get_fi_names(response))
+ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
+```
+
+```{r}
+test_metrics <- get_test_metrics(new_model, 
+                                 curr_X_test,
+                                 curr_y_test,
+                                 transformation)
+test_pred <- test_metrics$pred
+disaster_idx <- get_test_dis_idx(response, daterange)
+event_metrics <- get_event_metrics(disaster_idx, test_pred, curr_y_test, transformation)
+```
+
+```{r}
+assign(paste(response, daterange, "ovp", sep = '_'),  
+       get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
+                                       disaster_idx))
+get(paste(response, daterange, "ovp", sep = '_'))
+ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
+  response_base <- str_replace(response, '_log', '')
+  lim <- case_when(response_base == 'daha' ~ 4,
+                    response_base == 'dmha' ~ 10,
+                    response_base == 'ha' ~ 10,
+                    .default = 4)
+  assign(paste(response, daterange, "subset", lim, "ovp", sep = '_'),  
+         get(paste(response, daterange, "ovp", sep = '_')) + 
+           coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
+  print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
+  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
+}
+```
+
+```{r}
+test_result <- test_result %>%
+  add_row(get_test_result_row('Exclude Event', response, daterange,
+                              test_metrics, event_metrics))
+
+negative_pred <- negative_pred %>%
+  add_row(tibble_row(Model = 'Exclude Event', 
+                     model_response_name = response, 
+                     daterange = daterange,
+                     'negative' = sum(test_pred < 0)))
+```
+
+#### Leave-one-out spatial tests {.tabset .tabset-pills}
+##### With Lag
+
+```{r}
+data <- bind_rows(daily_ha_excl_dis_train, daily_ha_excl_dis_test)
+# spatial_cv <- spatial_validation(curr_model, data, 'Exclude Event',
+# response, daterange, lag = TRUE, weight_max = lag_weight_max)
+#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv$cv_table
+```
+
+```{r}
+for (i in seq_along(spatial_cv$cv_plots)) {
+  print(spatial_cv$cv_plots[[i]])
+}
+```
+
+```{r, eval = TRUE}
+p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
+ggsave(
+  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
+  plot = p,
+  width = 15, height = 15, dpi = 300
+)
+```
+
+```{r}
+spatial_avg_result <- spatial_cv$cv_table %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_avg_result <- spatial_avg_result %>% 
+  select(where(~is.numeric(.x))) %>% 
+  colMeans(na.rm=TRUE)
+
+spatial_test_result <- spatial_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Exclude Event',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_avg_result)))
+spatial_avg_result
+```
+
+```{r}
+w <- data %>%
+  group_by(Monitor) %>%
+  summarise(n = n())
+spatial_table_w <- spatial_cv$cv_table %>%
+  left_join(w, join_by("Monitor"))
+
+spatial_table_w <- spatial_table_w %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_weighted_avg_result <- spatial_table_w %>% 
+  select(where(~is.numeric(.x))) %>% 
+  summarise(across(!all_of("n") , ~ weighted.mean(.x, n, na.rm = TRUE)))
+
+spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Exclude Event',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_weighted_avg_result%>%unlist())))
+
+spatial_weighted_avg_result
+```
+
+#### Leave-one-out temporal test
+```{r}
+# temporal_test <- temporal_validation(curr_model, data, 'Exclude Event',
+                                     # response, daterange, weight_max = temporal_weight_max)
+
+# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+
+temporal_test_result <- temporal_test_result %>%
+  add_row(temporal_test$result)
+
+temporal_test$result
+```
+
+```{r}
+temporal_test$plot
+ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+
+### Everything w.o Disaster Indicator {.tabset .tabset-pills}
+#### 80/20 test
+```{r echo = T, results = 'hide'}
+daterange <- 'full_unstrat'
+filename <- paste0('fit.xgb_', response, '_', daterange, '.rds')
+assign(paste0('fit.xgb_', response, '_', daterange), readRDS(paste0(model_folder, filename)))
+paste0('fit.xgb_', response, '_', daterange)
+```
+
+```{r}
+curr_model <- get(paste0('fit.xgb_', response, '_', daterange))
+curr_data <- get_curr_data(response, daterange)
+curr_X_train <- curr_data$X_train; curr_y_train <- curr_data$y_train
+curr_X_test <- curr_data$X_test; curr_y_test <- curr_data$y_test
+# Get new model (new variables + weight)
+new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v8020_weight_max)
+```
+
+```{r}
+# Feature importance of new model
+get_fi_plot(new_model, get_fi_names(response))
+ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
+```
+
+```{r}
+test_metrics <- get_test_metrics(new_model, 
+                                 curr_X_test,
+                                 curr_y_test,
+                                 transformation)
+test_pred <- test_metrics$pred
+disaster_idx <- get_test_dis_idx(response, daterange)
+event_metrics <- get_event_metrics(disaster_idx, test_pred, curr_y_test, transformation)
+```
+
+```{r}
+assign(paste(response, daterange, "ovp", sep = '_'),  
+       get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
+                                       disaster_idx))
+get(paste(response, daterange, "ovp", sep = '_'))
+ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
+  response_base <- str_replace(response, '_log', '')
+  lim <- case_when(response_base == 'daha' ~ 4,
+                    response_base == 'dmha' ~ 10,
+                    response_base == 'ha' ~ 10,
+                    .default = 4)
+  assign(paste(response, daterange, "subset", lim, "ovp", sep = '_'),  
+         get(paste(response, daterange, "ovp", sep = '_')) + 
+           coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
+  print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
+  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
+}
+```
+
+```{r}
+test_result_unstrat <- test_result_unstrat %>%
+  add_row(get_test_result_row('Everything w.o Event Indicator', response, daterange,
+                              test_metrics, event_metrics))
+
+
+negative_pred <- negative_pred %>%
+  add_row(tibble_row(Model = 'Everything w.o Event Indicator', 
+                     model_response_name = response, 
+                     daterange = daterange,
+                     'negative' = sum(test_pred < 0)))
+```
+
+#### Leave-one-out spatial tests {.tabset .tabset-pills}
+##### With Lag
+
+```{r}
+data <- bind_rows(daily_ha_full_train, daily_ha_full_test)
+# spatial_cv <- spatial_validation(curr_model, data, 'Everything w.o Event Indicator',
+# response, daterange, lag = TRUE, weight_max = lag_weight_max)
+#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv$cv_table
+```
+
+```{r}
+for (i in seq_along(spatial_cv$cv_plots)) {
+  print(spatial_cv$cv_plots[[i]])
+}
+```
+
+```{r, eval = TRUE}
+p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
+ggsave(
+  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
+  plot = p,
+  width = 15, height = 15, dpi = 300
+)
+```
+
+```{r}
+spatial_avg_result <- spatial_cv$cv_table %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_avg_result <- spatial_avg_result %>% 
+  select(where(~is.numeric(.x))) %>% 
+  colMeans(na.rm=TRUE)
+
+spatial_test_result <- spatial_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Everything w.o Event Indicator',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_avg_result)))
+spatial_avg_result
+```
+
+```{r}
+w <- data %>%
+  group_by(Monitor) %>%
+  summarise(n = n())
+spatial_table_w <- spatial_cv$cv_table %>%
+  left_join(w, join_by("Monitor"))
+
+spatial_table_w <- spatial_table_w %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_weighted_avg_result <- spatial_table_w %>% 
+  select(where(~is.numeric(.x))) %>% 
+  summarise(across(!all_of("n") , ~ weighted.mean(.x, n, na.rm = TRUE)))
+
+spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Everything w.o Event Indicator',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_weighted_avg_result%>%unlist())))
+
+spatial_weighted_avg_result
+```
+
+#### Leave-one-out temporal test
+```{r}
+# temporal_test <- temporal_validation(curr_model, data, 'Everything w.o Event Indicator',
+                                     # response, daterange, weight_max = temporal_weight_max)
+
+# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+
+temporal_test_result <- temporal_test_result %>%
+  add_row(temporal_test$result)
+
+temporal_test$result
+```
+
+```{r}
+temporal_test$plot
+ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+## Log DMHA {.tabset .tabset-pills}
+```{r}
+response <- 'dmha_log'
+transformation <- ifelse(str_detect(response, 'log'), 'log', 'None')
+```
+
+### Exclude Event {.tabset .tabset-pills}
+#### 80/20 test
+```{r}
+daterange <- 'excl_dis'
+filename <- paste0('fit.xgb_', response, '_', daterange, '.rds')
+assign(paste0('fit.xgb_', response, '_', daterange), readRDS(paste0(model_folder, filename)))
+paste0('fit.xgb_', response, '_', daterange)
+```
+
+```{r}
+curr_model <- get(paste0('fit.xgb_', response, '_', daterange))
+curr_data <- get_curr_data(response, daterange)
+curr_X_train <- curr_data$X_train; curr_y_train <- curr_data$y_train
+curr_X_test <- curr_data$X_test; curr_y_test <- curr_data$y_test
+# Get new model (new variables + weight)
+new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v8020_weight_max)
+```
+
+```{r}
+# Feature importance of new model
+get_fi_plot(new_model, get_fi_names(response))
+ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
+```
+
+```{r}
+test_metrics <- get_test_metrics(new_model, 
+                                 curr_X_test,
+                                 curr_y_test,
+                                 transformation)
+test_pred <- test_metrics$pred
+disaster_idx <- get_test_dis_idx(response, daterange)
+event_metrics <- get_event_metrics(disaster_idx, test_pred, curr_y_test, transformation)
+```
+
+```{r}
+assign(paste(response, daterange, "ovp", sep = '_'),  
+       get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
+                                       disaster_idx))
+get(paste(response, daterange, "ovp", sep = '_'))
+ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
+  response_base <- str_replace(response, '_log', '')
+  lim <- case_when(response_base == 'daha' ~ 4,
+                    response_base == 'dmha' ~ 10,
+                    response_base == 'ha' ~ 10,
+                    .default = 4)
+  assign(paste(response, daterange, "subset", lim, "ovp", sep = '_'),  
+         get(paste(response, daterange, "ovp", sep = '_')) + 
+           coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
+  print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
+  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
+}
+```
+
+
+```{r}
+test_result <- test_result %>%
+  add_row(get_test_result_row('Exclude Event', response, daterange,
+                              test_metrics, event_metrics))
+```
+
+#### Leave-one-out spatial tests {.tabset .tabset-pills}
+##### With Lag
+
+```{r}
+data <- bind_rows(daily_ha_excl_dis_train, daily_ha_excl_dis_test)
+# spatial_cv <- spatial_validation(curr_model, data, 'Exclude Event',
+# response, daterange, lag = TRUE, weight_max = lag_weight_max)
+#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv$cv_table
+```
+
+```{r}
+for (i in seq_along(spatial_cv$cv_plots)) {
+  print(spatial_cv$cv_plots[[i]])
+}
+```
+
+```{r, eval = TRUE}
+p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
+ggsave(
+  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
+  plot = p,
+  width = 15, height = 15, dpi = 300
+)
+```
+
+```{r}
+spatial_avg_result <- spatial_cv$cv_table %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_avg_result <- spatial_avg_result %>% 
+  select(where(~is.numeric(.x))) %>% 
+  colMeans(na.rm=TRUE)
+
+spatial_test_result <- spatial_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Exclude Event',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_avg_result)))
+spatial_avg_result
+```
+
+```{r}
+w <- data %>%
+  group_by(Monitor) %>%
+  summarise(n = n())
+spatial_table_w <- spatial_cv$cv_table %>%
+  left_join(w, join_by("Monitor"))
+
+spatial_table_w <- spatial_table_w %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_weighted_avg_result <- spatial_table_w %>% 
+  select(where(~is.numeric(.x))) %>% 
+  summarise(across(!all_of("n") , ~ weighted.mean(.x, n, na.rm = TRUE)))
+
+spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Exclude Event',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_weighted_avg_result%>%unlist())))
+
+spatial_weighted_avg_result
+```
+
+#### Leave-one-out temporal test
+```{r}
+# temporal_test <- temporal_validation(curr_model, data, 'Exclude Event',
+                                     # response, daterange, weight_max = temporal_weight_max)
+
+# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+
+temporal_test_result <- temporal_test_result %>%
+  add_row(temporal_test$result)
+
+temporal_test$result
+```
+
+```{r}
+temporal_test$plot
+ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+### Everything w.o Disaster Indicator {.tabset .tabset-pills}
+#### 80/20 test
+```{r echo = T, results = 'hide'}
+daterange <- 'full_unstrat'
+filename <- paste0('fit.xgb_', response, '_', daterange, '.rds')
+assign(paste0('fit.xgb_', response, '_', daterange), readRDS(paste0(model_folder, filename)))
+paste0('fit.xgb_', response, '_', daterange)
+```
+
+```{r}
+curr_model <- get(paste0('fit.xgb_', response, '_', daterange))
+curr_data <- get_curr_data(response, daterange)
+curr_X_train <- curr_data$X_train; curr_y_train <- curr_data$y_train
+curr_X_test <- curr_data$X_test; curr_y_test <- curr_data$y_test
+# Get new model (new variables + weight)
+new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v8020_weight_max)
+```
+
+```{r}
+# Feature importance of new model
+get_fi_plot(new_model, get_fi_names(response))
+# fi2 <-get_fi_plot(new_model, get_fi_names(response))
+ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
+```
+
+```{r}
+test_metrics <- get_test_metrics(new_model, 
+                                 curr_X_test,
+                                 curr_y_test,
+                                 transformation)
+test_pred <- test_metrics$pred
+disaster_idx <- get_test_dis_idx(response, daterange)
+event_metrics <- get_event_metrics(disaster_idx, test_pred, curr_y_test, transformation)
+```
+
+```{r}
+assign(paste(response, daterange, "ovp", sep = '_'),  
+       get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
+                                       disaster_idx))
+get(paste(response, daterange, "ovp", sep = '_'))
+ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
+  response_base <- str_replace(response, '_log', '')
+  lim <- case_when(response_base == 'daha' ~ 4,
+                    response_base == 'dmha' ~ 10,
+                    response_base == 'ha' ~ 10,
+                    .default = 4)
+  assign(paste(response, daterange, "subset", lim, "ovp", sep = '_'),  
+         get(paste(response, daterange, "ovp", sep = '_')) + 
+           coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
+  print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
+  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
+}
+```
+
+```{r}
+test_result_unstrat <- test_result_unstrat %>%
+  add_row(get_test_result_row('Everything w.o Event Indicator', response, daterange,
+                              test_metrics, event_metrics))
+```
+
+#### Leave-one-out spatial tests {.tabset .tabset-pills}
+##### With Lag
+
+```{r}
+data <- bind_rows(daily_ha_full_train, daily_ha_full_test)
+# spatial_cv <- spatial_validation(curr_model, data, 'Everything w.o Event Indicator',
+# response, daterange, lag = TRUE, weight_max = lag_weight_max)
+#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv$cv_table
+```
+
+```{r}
+for (i in seq_along(spatial_cv$cv_plots)) {
+  print(spatial_cv$cv_plots[[i]])
+}
+```
+
+```{r, eval = TRUE}
+p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
+ggsave(
+  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
+  plot = p,
+  width = 15, height = 15, dpi = 300
+)
+```
+
+```{r}
+spatial_avg_result <- spatial_cv$cv_table %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_avg_result <- spatial_avg_result %>% 
+  select(where(~is.numeric(.x))) %>% 
+  colMeans(na.rm=TRUE)
+
+spatial_test_result <- spatial_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Everything w.o Event Indicator',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_avg_result)))
+spatial_avg_result
+```
+
+```{r}
+w <- data %>%
+  group_by(Monitor) %>%
+  summarise(n = n())
+spatial_table_w <- spatial_cv$cv_table %>%
+  left_join(w, join_by("Monitor"))
+
+spatial_table_w <- spatial_table_w %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_weighted_avg_result <- spatial_table_w %>% 
+  select(where(~is.numeric(.x))) %>% 
+  summarise(across(!all_of("n") , ~ weighted.mean(.x, n, na.rm = TRUE)))
+
+spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Everything w.o Event Indicator',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_weighted_avg_result%>%unlist())))
+
+spatial_weighted_avg_result
+```
+
+#### Leave-one-out temporal test
+```{r}
+# temporal_test <- temporal_validation(curr_model, data, 'Everything w.o Event Indicator',
+                                     # response, daterange, weight_max = temporal_weight_max)
+
+# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+
+temporal_test_result <- temporal_test_result %>%
+  add_row(temporal_test$result)
+
+temporal_test$result
+```
+
+```{r}
+temporal_test$plot
+ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+dmha_log_full_loeo_plot <- temporal_test$plot
+```
+
+
+#### Fit final model
+```{r}
+log_dmha_full_xgb <- fit_final_model(curr_model, data, response)
+saveRDS(log_dmha_full_xgb, paste0(model_folder, 'log_dmha_full_final.rds'))
+```
+
+## HA {.tabset .tabset-pills}
+```{r}
+response <- 'ha'
+transformation <- ifelse(str_detect(response, 'log'), 'log', 'None')
+```
+
+### Exclude Event {.tabset .tabset-pills}
+#### 80/20 test
+```{r echo = T, results = 'hide'}
+daterange <- 'excl_dis'
+filename <- paste0('fit.xgb_', response, '_', daterange, '.rds')
+assign(paste0('fit.xgb_', response, '_', daterange), readRDS(paste0(model_folder, filename)))
+paste0('fit.xgb_', response, '_', daterange)
+```
+
+```{r}
+curr_model <- get(paste0('fit.xgb_', response, '_', daterange))
+curr_data <- get_curr_data(response, daterange)
+curr_X_train <- curr_data$X_train; curr_y_train <- curr_data$y_train
+curr_X_test <- curr_data$X_test; curr_y_test <- curr_data$y_test
+# Get new model (new variables + weight)
+new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v8020_weight_max)
+```
+
+```{r}
+# Feature importance of new model
+get_fi_plot(new_model, get_fi_names(response))
+ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
+```
+
+```{r}
+test_metrics <- get_test_metrics(new_model, 
+                                 curr_X_test,
+                                 curr_y_test,
+                                 transformation)
+test_pred <- test_metrics$pred
+disaster_idx <- get_test_dis_idx(response, daterange)
+event_metrics <- get_event_metrics(disaster_idx, test_pred, curr_y_test, transformation)
+```
+
+```{r}
+assign(paste(response, daterange, "ovp", sep = '_'),  
+       get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
+                                       disaster_idx))
+get(paste(response, daterange, "ovp", sep = '_'))
+ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
+  response_base <- str_replace(response, '_log', '')
+  lim <- case_when(response_base == 'daha' ~ 4,
+                    response_base == 'dmha' ~ 10,
+                    response_base == 'ha' ~ 10,
+                    .default = 4)
+  assign(paste(response, daterange, "subset", lim, "ovp", sep = '_'),  
+         get(paste(response, daterange, "ovp", sep = '_')) + 
+           coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
+  print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
+  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
+}
+```
+
+```{r}
+test_result <- test_result %>%
+  add_row(get_test_result_row('Exclude Event', response, daterange,
+                              test_metrics, event_metrics))
+
+negative_pred <- negative_pred %>%
+  add_row(tibble_row(Model = 'Exclude Event', 
+                     model_response_name = response, 
+                     daterange = daterange,
+                     'negative' = sum(test_pred < 0)))
+```
+
+#### Leave-one-out spatial tests {.tabset .tabset-pills}
+##### With Lag
+
+```{r}
+data <- bind_rows(hourly_excl_dis_train, hourly_excl_dis_test)
+# spatial_cv <- spatial_validation(curr_model, data, 'Exclude Event',
+# response, daterange, lag = TRUE, weight_max = lag_weight_max)
+#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv$cv_table
+```
+
+```{r}
+for (i in seq_along(spatial_cv$cv_plots)) {
+  print(spatial_cv$cv_plots[[i]])
+}
+```
+
+```{r, eval = TRUE}
+p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
+ggsave(
+  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
+  plot = p,
+  width = 15, height = 15, dpi = 300
+)
+```
+
+```{r}
+spatial_avg_result <- spatial_cv$cv_table %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_avg_result <- spatial_avg_result %>% 
+  select(where(~is.numeric(.x))) %>% 
+  colMeans(na.rm=TRUE)
+
+spatial_test_result <- spatial_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Exclude Event',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_avg_result)))
+spatial_avg_result
+```
+
+```{r}
+w <- data %>%
+  group_by(Monitor) %>%
+  summarise(n = n())
+spatial_table_w <- spatial_cv$cv_table %>%
+  left_join(w, join_by("Monitor"))
+
+spatial_table_w <- spatial_table_w %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_weighted_avg_result <- spatial_table_w %>% 
+  select(where(~is.numeric(.x))) %>% 
+  summarise(across(!all_of("n") , ~ weighted.mean(.x, n, na.rm = TRUE)))
+
+spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Exclude Event',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_weighted_avg_result%>%unlist())))
+
+spatial_weighted_avg_result
+```
+
+#### Leave-one-out temporal test
+```{r}
+# temporal_test <- temporal_validation(curr_model, data, 'Exclude Event',
+                                     # response, daterange, weight_max = temporal_weight_max)
+
+# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+
+temporal_test_result <- temporal_test_result %>%
+  add_row(temporal_test$result)
+
+temporal_test$result
+```
+
+```{r}
+temporal_test$plot
+ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+### Everything w.o Disaster Indicator {.tabset .tabset-pills}
+#### 80/20 test
+```{r echo = T, results = 'hide'}
+daterange <- 'full_unstrat'
+filename <- paste0('fit.xgb_', response, '_', daterange, '.rds')
+assign(paste0('fit.xgb_', response, '_', daterange), readRDS(paste0(model_folder, filename)))
+paste0('fit.xgb_', response, '_', daterange)
+```
+
+```{r}
+curr_model <- get(paste0('fit.xgb_', response, '_', daterange))
+curr_data <- get_curr_data(response, daterange)
+curr_X_train <- curr_data$X_train; curr_y_train <- curr_data$y_train
+curr_X_test <- curr_data$X_test; curr_y_test <- curr_data$y_test
+# Get new model (new variables + weight)
+new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v8020_weight_max)
+```
+
+```{r}
+# Feature importance of new model
+get_fi_plot(new_model, get_fi_names(response))
+ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
+```
+
+```{r}
+test_metrics <- get_test_metrics(new_model, 
+                                 curr_X_test,
+                                 curr_y_test,
+                                 transformation)
+test_pred <- test_metrics$pred
+disaster_idx <- get_test_dis_idx(response, daterange)
+event_metrics <- get_event_metrics(disaster_idx, test_pred, curr_y_test, transformation)
+```
+
+```{r}
+assign(paste(response, daterange, "ovp", sep = '_'),  
+       get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
+                                       disaster_idx))
+get(paste(response, daterange, "ovp", sep = '_'))
+ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
+  response_base <- str_replace(response, '_log', '')
+  lim <- case_when(response_base == 'daha' ~ 4,
+                    response_base == 'dmha' ~ 10,
+                    response_base == 'ha' ~ 10,
+                    .default = 4)
+  assign(paste(response, daterange, "subset", lim, "ovp", sep = '_'),  
+         get(paste(response, daterange, "ovp", sep = '_')) + 
+           coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
+  print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
+  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
+}
+```
+
+```{r}
+test_result_unstrat <- test_result_unstrat %>%
+  add_row(get_test_result_row('Everything w.o Event Indicator', response, daterange,
+                              test_metrics, event_metrics))
+
+negative_pred <- negative_pred %>%
+  add_row(tibble_row(Model = 'Everything w.o Event Indicator', 
+                     model_response_name = response, 
+                     daterange = daterange,
+                     'negative' = sum(test_pred < 0)))
+```
+
+#### Leave-one-out spatial tests {.tabset .tabset-pills}
+##### With Lag
+
+```{r}
+data <- bind_rows(hourly_full_train, hourly_full_test)
+# spatial_cv <- spatial_validation(curr_model, data, 'Everything w.o Event Indicator',
+# response, daterange, lag = TRUE, weight_max = lag_weight_max)
+#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv$cv_table
+```
+
+```{r}
+for (i in seq_along(spatial_cv$cv_plots)) {
+  print(spatial_cv$cv_plots[[i]])
+}
+```
+
+```{r, eval = TRUE}
+p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
+ggsave(
+  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
+  plot = p,
+  width = 15, height = 15, dpi = 300
+)
+```
+
+```{r}
+spatial_avg_result <- spatial_cv$cv_table %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_avg_result <- spatial_avg_result %>% 
+  select(where(~is.numeric(.x))) %>% 
+  colMeans(na.rm=TRUE)
+
+spatial_test_result <- spatial_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Everything w.o Event Indicator',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_avg_result)))
+spatial_avg_result
+```
+
+```{r}
+w <- data %>%
+  group_by(Monitor) %>%
+  summarise(n = n())
+spatial_table_w <- spatial_cv$cv_table %>%
+  left_join(w, join_by("Monitor"))
+
+spatial_table_w <- spatial_table_w %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_weighted_avg_result <- spatial_table_w %>% 
+  select(where(~is.numeric(.x))) %>% 
+  summarise(across(!all_of("n") , ~ weighted.mean(.x, n, na.rm = TRUE)))
+
+spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Everything w.o Event Indicator',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_weighted_avg_result%>%unlist())))
+
+spatial_weighted_avg_result
+```
+
+#### Leave-one-out temporal test
+```{r}
+# temporal_test <- temporal_validation(curr_model, data, 'Everything w.o Event Indicator',
+                                     # response, daterange, weight_max = temporal_weight_max)
+
+# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+
+temporal_test_result <- temporal_test_result %>%
+  add_row(temporal_test$result)
+
+temporal_test$result
+```
+
+```{r}
+temporal_test$plot
+ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+## Log HA {.tabset .tabset-pills}
+```{r}
+response <- 'ha_log'
+transformation <- ifelse(str_detect(response, 'log'), 'log', 'None')
+```
+
+### Exclude Event {.tabset .tabset-pills}
+#### 80/20 test
+```{r}
+daterange <- 'excl_dis'
+filename <- paste0('fit.xgb_', response, '_', daterange, '.rds')
+assign(paste0('fit.xgb_', response, '_', daterange), readRDS(paste0(model_folder, filename)))
+paste0('fit.xgb_', response, '_', daterange)
+```
+
+```{r}
+curr_model <- get(paste0('fit.xgb_', response, '_', daterange))
+curr_data <- get_curr_data(response, daterange)
+curr_X_train <- curr_data$X_train; curr_y_train <- curr_data$y_train
+curr_X_test <- curr_data$X_test; curr_y_test <- curr_data$y_test
+# Get new model (new variables + weight)
+new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v8020_weight_max)
+```
+
+```{r}
+# Feature importance of new model
+get_fi_plot(new_model, get_fi_names(response))
+ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
+```
+
+```{r}
+test_metrics <- get_test_metrics(new_model, 
+                                 curr_X_test,
+                                 curr_y_test,
+                                 transformation)
+test_pred <- test_metrics$pred
+disaster_idx <- get_test_dis_idx(response, daterange)
+event_metrics <- get_event_metrics(disaster_idx, test_pred, curr_y_test, transformation)
+```
+
+```{r}
+assign(paste(response, daterange, "ovp", sep = '_'),  
+       get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
+                                       disaster_idx))
+get(paste(response, daterange, "ovp", sep = '_'))
+ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
+  response_base <- str_replace(response, '_log', '')
+  lim <- case_when(response_base == 'daha' ~ 4,
+                    response_base == 'dmha' ~ 10,
+                    response_base == 'ha' ~ 10,
+                    .default = 4)
+  assign(paste(response, daterange, "subset", lim, "ovp", sep = '_'),  
+         get(paste(response, daterange, "ovp", sep = '_')) + 
+           coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
+  print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
+  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
+}
+```
+
+```{r}
+test_result <- test_result %>%
+  add_row(get_test_result_row('Exclude Event', response, daterange,
+                              test_metrics, event_metrics))
+```
+
+#### Leave-one-out spatial tests {.tabset .tabset-pills}
+##### With Lag
+
+```{r}
+data <- bind_rows(hourly_excl_dis_train, hourly_excl_dis_test)
+# spatial_cv <- spatial_validation(curr_model, data, 'Exclude Event',
+# response, daterange, lag = TRUE, weight_max = lag_weight_max)
+#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv$cv_table
+```
+
+```{r}
+for (i in seq_along(spatial_cv$cv_plots)) {
+  print(spatial_cv$cv_plots[[i]])
+}
+```
+
+```{r, eval = TRUE}
+p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
+ggsave(
+  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
+  plot = p,
+  width = 15, height = 15, dpi = 300
+)
+```
+
+```{r}
+spatial_avg_result <- spatial_cv$cv_table %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_avg_result <- spatial_avg_result %>% 
+  select(where(~is.numeric(.x))) %>% 
+  colMeans(na.rm=TRUE)
+
+spatial_test_result <- spatial_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Exclude Event',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_avg_result)))
+spatial_avg_result
+```
+
+```{r}
+w <- data %>%
+  group_by(Monitor) %>%
+  summarise(n = n())
+spatial_table_w <- spatial_cv$cv_table %>%
+  left_join(w, join_by("Monitor"))
+
+spatial_table_w <- spatial_table_w %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_weighted_avg_result <- spatial_table_w %>% 
+  select(where(~is.numeric(.x))) %>% 
+  summarise(across(!all_of("n") , ~ weighted.mean(.x, n, na.rm = TRUE)))
+
+spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Exclude Event',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_weighted_avg_result%>%unlist())))
+
+spatial_weighted_avg_result
+```
+
+#### Leave-one-out temporal test
+```{r}
+# temporal_test <- temporal_validation(curr_model, data, 'Exclude Event',
+                                     # response, daterange, weight_max = temporal_weight_max)
+
+# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+
+temporal_test_result <- temporal_test_result %>%
+  add_row(temporal_test$result)
+
+temporal_test$result
+```
+
+```{r}
+temporal_test$plot
+ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+### Everything w.o Disaster Indicator {.tabset .tabset-pills}
+#### 80/20 test
+```{r echo = T, results = 'hide'}
+daterange <- 'full_unstrat'
+filename <- paste0('fit.xgb_', response, '_', daterange, '.rds')
+assign(paste0('fit.xgb_', response, '_', daterange), readRDS(paste0(model_folder, filename)))
+paste0('fit.xgb_', response, '_', daterange)
+```
+
+```{r}
+curr_model <- get(paste0('fit.xgb_', response, '_', daterange))
+curr_data <- get_curr_data(response, daterange)
+curr_X_train <- curr_data$X_train; curr_y_train <- curr_data$y_train
+curr_X_test <- curr_data$X_test; curr_y_test <- curr_data$y_test
+# Get new model (new variables + weight)
+new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v8020_weight_max)
+```
+
+```{r}
+# Feature importance of new model
+get_fi_plot(new_model, get_fi_names(response))
+ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
+```
+
+```{r}
+test_metrics <- get_test_metrics(new_model, 
+                                 curr_X_test,
+                                 curr_y_test,
+                                 transformation)
+test_pred <- test_metrics$pred
+disaster_idx <- get_test_dis_idx(response, daterange)
+event_metrics <- get_event_metrics(disaster_idx, test_pred, curr_y_test, transformation)
+```
+
+```{r}
+assign(paste(response, daterange, "ovp", sep = '_'),  
+       get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
+                                       disaster_idx))
+get(paste(response, daterange, "ovp", sep = '_'))
+ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
+  response_base <- str_replace(response, '_log', '')
+  lim <- case_when(response_base == 'daha' ~ 4,
+                    response_base == 'dmha' ~ 10,
+                    response_base == 'ha' ~ 10,
+                    .default = 4)
+  assign(paste(response, daterange, "subset", lim, "ovp", sep = '_'),  
+         get(paste(response, daterange, "ovp", sep = '_')) + 
+           coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
+  print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
+  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
+}
+```
+
+```{r}
+test_result_unstrat <- test_result_unstrat %>%
+  add_row(get_test_result_row('Everything w.o Event Indicator', response, daterange,
+                              test_metrics, event_metrics))
+```
+  
+#### Leave-one-out spatial tests {.tabset .tabset-pills}
+##### With Lag
+```{r}
+data <- bind_rows(hourly_full_train, hourly_full_test)
+# spatial_cv <- spatial_validation(curr_model, data, 'Everything w.o Event Indicator',
+# response, daterange, lag = TRUE, weight_max = lag_weight_max)
+#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv$cv_table
+```
+
+```{r}
+for (i in seq_along(spatial_cv$cv_plots)) {
+  print(spatial_cv$cv_plots[[i]])
+}
+```
+
+```{r, eval = TRUE}
+p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
+ggsave(
+  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
+  plot = p,
+  width = 15, height = 15, dpi = 300
+)
+```
+
+```{r}
+spatial_avg_result <- spatial_cv$cv_table %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_avg_result <- spatial_avg_result %>% 
+  select(where(~is.numeric(.x))) %>% 
+  colMeans(na.rm=TRUE)
+
+spatial_test_result <- spatial_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Everything w.o Event Indicator',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_avg_result)))
+spatial_avg_result
+```
+
+```{r}
+w <- data %>%
+  group_by(Monitor) %>%
+  summarise(n = n())
+
+spatial_table_w <- spatial_cv$cv_table %>%
+  left_join(w, join_by("Monitor"))
+
+spatial_table_w <- spatial_table_w %>%
+  mutate(R2_mean = mean(c(event_R2, normal_R2), na.rm=TRUE),
+         RMSE_mean = mean(c(event_RMSE, normal_RMSE), na.rm=TRUE),
+         coef_mean = mean(c(event_coef, normal_coef), na.rm=TRUE)) %>%
+  mutate(R2_mean = coalesce(R2_mean, R2),
+         RMSE_mean =  coalesce(event_RMSE, RMSE),
+         coef_mean =  coalesce(coef_mean, coef))
+
+spatial_weighted_avg_result <- spatial_table_w %>% 
+  select(where(~is.numeric(.x))) %>% 
+  summarise(across(!all_of("n") , ~ weighted.mean(.x, n, na.rm = TRUE)))
+
+spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  add_row(bind_cols(as_tibble_row(c(Model = 'Everything w.o Event Indicator',
+                                    model_response_name = response,
+                                    daterange = daterange, lag = TRUE, coordinates = TRUE)),
+          as_tibble_row(spatial_weighted_avg_result%>%unlist())))
+
+spatial_weighted_avg_result
+```
+
+#### Leave-one-out temporal test
+```{r}
+# temporal_test <- temporal_validation(curr_model, data, 'Everything w.o Event Indicator',
+                                     # response, daterange, weight_max = temporal_weight_max)
+
+# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+
+temporal_test_result <- temporal_test_result %>%
+  add_row(temporal_test$result)
+
+temporal_test$result
+```
+
+```{r}
+temporal_test$plot
+ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
+```
+
+```{r}
+ha_log_full_loeo_plot <- temporal_test$plot
+```
+
+# XGB Model performances {.tabset .tabset-pills}
+## 80/20 Test Result
+```{r}
+base_test_result <- test_result %>%
+  mutate(transformation = if_else(str_detect(model_response_name, '_log'), 'Log', '')) %>%
+  filter(transformation == '') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  arrange(factor(Model, levels = unique(test_result$Model))) %>%
+  select(-transformation, -contains('BT_'))
+
+log_test_result <- test_result %>%
+  mutate(transformation = if_else(str_detect(model_response_name, '_log'), 'Log', '')) %>%
+  filter(transformation == 'Log') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg'))
+
+base_test_result_unstrat <- test_result_unstrat %>%
+  mutate(transformation = if_else(str_detect(model_response_name, '_log'), 'Log', '')) %>%
+  filter(transformation == '') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  arrange(factor(Model, levels = unique(test_result$Model))) %>%
+  select(-transformation, -contains('BT_'))
+
+log_test_result_unstrat <- test_result_unstrat %>%
+  mutate(transformation = if_else(str_detect(model_response_name, '_log'), 'Log', '')) %>%
+  filter(transformation == 'Log') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg'))
+```
+
+```{r}
+daterange_order <- c('excl_dis', 'full_unstrat')
+response_order <- c('Daily Avg From Hourly Avg', 'Daily Max From Hourly Avg', 'Hourly Avg')
+
+# XGB Plot
+top <- base_test_result %>%
+  filter(Model=='Exclude Event') %>% 
+  # rbind(base_test_result_unstrat %>% filter(Model == 'Everything w.o Event Indicator')) %>%
+  rbind(base_test_result_unstrat)  %>%
+  mutate(response_base = factor(response_base, levels = response_order),
+         daterange = factor(daterange, levels = daterange_order)) %>%
+  arrange(daterange, response_base) %>%
+  mutate(n = c(rep(nrow(daily_daha_excl_dis_test_Xmat), 2),
+               nrow(hourly_excl_dis_test_Xmat),
+               rep(nrow(daily_daha_full_test_Xmat), 2),
+               nrow(hourly_full_test_Xmat))) %>%
+  select('response_base', 'daterange', 'n', 'R2', 'RMSE', 'event_R2', 
+         'event_RMSE', 'normal_R2', 'normal_RMSE')
+
+bottom <- log_test_result %>%
+  filter(Model=='Exclude Event') %>% 
+  # rbind(log_test_result_unstrat %>% filter(Model == 'Everything w.o Event Indicator')) %>%
+  rbind(log_test_result_unstrat)  %>%
+  mutate(response_base = factor(response_base, levels = response_order),
+         daterange = factor(daterange, levels = daterange_order)) %>%
+  arrange(daterange, response_base) %>%
+  mutate(n = c(rep(nrow(daily_daha_excl_dis_test_Xmat), 2),
+               nrow(hourly_excl_dis_test_Xmat),
+               rep(nrow(daily_daha_full_test_Xmat), 2),
+               nrow(hourly_full_test_Xmat))) %>%
+  relocate('n', .after = 'daterange') %>%
+  select('response_base', 'daterange', 'n', 'BT_R2', 'BT_RMSE', 'BT_event_R2', 
+         'BT_event_RMSE', 'BT_normal_R2', 'BT_normal_RMSE') %>%
+  rename_with(~ gsub("BT_", "", .x, fixed = TRUE))
+
+xgb_result_table <- bind_rows(top,bottom) %>%
+  relocate('daterange') %>%
+  setNames(c("Time period", "Response", "N", rep(c("R2", "RMSE"), 3)))
+
+full_result_table_kable <- xgb_result_table %>%
+  knitr::kable(format = 'latex', digits = 2) %>%
+  pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
+                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 3, 'Full' = 2, 'Event' = 2, 'Routine' = 2))
+
+writeLines(full_result_table_kable, '../figures/full_result_table_kable.tex')
+
+xgb_result_table %>%
+  knitr::kable(format = 'pipe', digits = 4, table.attr = "style='width:100%;'") %>%
+    pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
+                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 3, 'Full' = 2, 'Event' = 2, 'Routine' = 2)) %>%
+  kable_styling()
+```
+
+## Spatial leave-one-out Test Results {.tabset .tabset-pills}
+### With spatial lag {.tabset .tabset-pills} 
+#### Unweighted {.tabset .tabset-pills} 
+##### Full time period metrics
+
+```{r}
+base_spatial_test_result <- spatial_test_result %>%
+  filter(lag == TRUE, coordinates == TRUE) %>%
+  mutate(transformation = if_else(str_detect(model_response_name, '_log'), 'Log', '')) %>%
+  filter(transformation == '') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  arrange(factor(Model, levels = unique(spatial_test_result$Model))) %>%
+  mutate(response_base = factor(response_base, levels = response_order),
+         daterange = factor(daterange, levels = daterange_order)) %>%
+  arrange(daterange, response_base)
+
+log_spatial_test_result <- spatial_test_result %>%
+  filter(lag == TRUE, coordinates == TRUE) %>%
+  mutate(transformation = if_else(str_detect(model_response_name, '_log'), 'Log', '')) %>%
+  filter(transformation == 'Log') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  arrange(factor(Model, levels = unique(spatial_test_result$Model))) %>%
+  mutate(response_base = factor(response_base, levels = response_order),
+         daterange = factor(daterange, levels = daterange_order)) %>%
+  arrange(daterange, response_base)
+
+top <- base_spatial_test_result %>%
+  # filter(Model %in% c('Exclude Event', 'Everything w.o Event Indicator')) %>% 
+  select('response_base', 'daterange', 'R2', 'RMSE', 'event_R2', 
+         'event_RMSE', 'normal_R2', 'normal_RMSE')
+
+bottom <- log_spatial_test_result %>%
+  # filter(Model %in% c('Exclude Event', 'Everything w.o Event Indicator')) %>% 
+  select('response_base', 'daterange', 'R2', 'RMSE', 'event_R2', 
+         'event_RMSE', 'normal_R2', 'normal_RMSE')
+
+spatial_result_table <- bind_rows(top,bottom) %>%
+  relocate('daterange') %>%
+  setNames(c("Time period", "Response",  rep(c("R2", "RMSE"), 3)))
+
+spatial_result_table_kable <- spatial_result_table %>%
+  knitr::kable(format = 'latex', digits = 2) %>%
+  pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
+                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 2, 'Full' = 2, 'Event' = 2, 'Routine' = 2))
+
+# writeLines(spatial_result_table_kable, '../figures/spatial_result_table_kable.tex')
+
+spatial_result_table %>%
+  knitr::kable(format = 'pipe', digits = 4, table.attr = "style='width:100%;'") %>%
+    pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
+                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 2, 'Full' = 2, 'Event' = 2, 'Routine' = 2)) %>%
+  kable_styling()
+```
+
+##### Average of Average of event and routine metrics
+
+```{r}
+base_spatial_test_result <- spatial_test_result %>%
+  filter(lag == TRUE, coordinates == TRUE) %>%
+  mutate(transformation = if_else(str_detect(model_response_name, '_log'), 'Log', '')) %>%
+  filter(transformation == '') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  arrange(factor(Model, levels = unique(spatial_test_result$Model))) %>%
+  mutate(response_base = factor(response_base, levels = response_order),
+         daterange = factor(daterange, levels = daterange_order)) %>%
+  arrange(daterange, response_base)
+
+log_spatial_test_result <- spatial_test_result %>%
+  filter(lag == TRUE, coordinates == TRUE) %>%
+  mutate(transformation = if_else(str_detect(model_response_name, '_log'), 'Log', '')) %>%
+  filter(transformation == 'Log') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  arrange(factor(Model, levels = unique(spatial_test_result$Model))) %>%
+  mutate(response_base = factor(response_base, levels = response_order),
+         daterange = factor(daterange, levels = daterange_order)) %>%
+  arrange(daterange, response_base)
+
+top <- base_spatial_test_result %>%
+  # filter(Model %in% c('Exclude Event', 'Everything w.o Event Indicator')) %>% 
+  select('response_base', 'daterange', 'R2_mean', 'RMSE_mean')
+
+bottom <- log_spatial_test_result %>%
+  # filter(Model %in% c('Exclude Event', 'Everything w.o Event Indicator')) %>% 
+  select('response_base', 'daterange', 'R2_mean', 'RMSE_mean')
+
+spatial_result_table <- bind_rows(top,bottom) %>%
+  relocate('daterange') %>%
+  setNames(c("Time period", "Response",  c("R2", "RMSE")))
+
+spatial_result_table_kable <- spatial_result_table %>%
+  knitr::kable(format = 'latex', digits = 2) %>%
+  pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
+                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 2, 'Full' = 2))
+
+spatial_result_table %>%
+  knitr::kable(format = 'pipe', digits = 4, table.attr = "style='width:100%;'") %>%
+    pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
+                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 2, 'Full' = 2)) %>%
+  kable_styling()
+```
+
+#### Weighted {.tabset .tabset-pills}
+##### Number of left-out-observations per monitor for exclude event model
+```{r}
+# Number of observations per monitor per date range
+excl_dis_data <- bind_rows(daily_ha_train, daily_ha_test) %>%
+  filter(!(year == 2021 & month %in% 10:12))
+
+excl_dis_data %>% 
+  group_by(Monitor) %>%
+  summarise(n = n())
+```
+
+##### Number of left-out-observations per monitor for full time models
+```{r}
+bind_rows(daily_ha_train, daily_ha_test) %>% 
+  group_by(Monitor) %>%
+  summarise(n = n())
+```
+
+##### Full time period metrics
+
+```{r}
+base_spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  filter(lag == TRUE, coordinates == TRUE) %>%
+  mutate(transformation = if_else(str_detect(model_response_name, '_log'), 'Log', '')) %>%
+  filter(transformation == '') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  arrange(factor(Model, levels = unique(spatial_test_result$Model))) %>%
+  mutate(response_base = factor(response_base, levels = response_order),
+         daterange = factor(daterange, levels = daterange_order)) %>%
+  arrange(daterange, response_base)
+
+log_spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  filter(lag == TRUE, coordinates == TRUE) %>%
+  mutate(transformation = if_else(str_detect(model_response_name, '_log'), 'Log', '')) %>%
+  filter(transformation == 'Log') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  arrange(factor(Model, levels = unique(spatial_test_result$Model))) %>%
+  mutate(response_base = factor(response_base, levels = response_order),
+         daterange = factor(daterange, levels = daterange_order)) %>%
+  arrange(daterange, response_base)
+
+top <- base_spatial_weighted_test_result %>%
+  # filter(Model %in% c('Exclude Event', 'Everything w.o Event Indicator')) %>% 
+  select('response_base', 'daterange', 'R2', 'RMSE', 'event_R2', 
+         'event_RMSE', 'normal_R2', 'normal_RMSE')
+
+bottom <- log_spatial_weighted_test_result %>%
+  # filter(Model %in% c('Exclude Event', 'Everything w.o Event Indicator')) %>% 
+  select('response_base', 'daterange', 'R2', 'RMSE', 'event_R2', 
+         'event_RMSE', 'normal_R2', 'normal_RMSE')
+
+spatial_weighted_result_table <- bind_rows(top,bottom) %>%
+  relocate('daterange') %>%
+  setNames(c("Time period", "Response",  rep(c("R2", "RMSE"), 3)))
+
+spatial_weighted_result_table_kable <- spatial_weighted_result_table %>%
+  knitr::kable(format = 'latex', digits = 2) %>%
+  pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
+                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 2, 'Full' = 2, 'Event' = 2, 'Routine' = 2))
+
+# writeLines(spatial_weighted_result_table_kable, '../figures/spatial_weighted_result_table_kable.tex')
+
+spatial_weighted_result_table %>%
+  knitr::kable(format = 'pipe', digits = 4, table.attr = "style='width:100%;'") %>%
+    pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
+                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 2, 'Full' = 2, 'Event' = 2, 'Routine' = 2)) %>%
+  kable_styling()
+```
+
+##### Average of Average of event and routine metrics
+
+```{r}
+base_spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  filter(lag == TRUE, coordinates == TRUE) %>%
+  mutate(transformation = if_else(str_detect(model_response_name, '_log'), 'Log', '')) %>%
+  filter(transformation == '') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  arrange(factor(Model, levels = unique(spatial_weighted_test_result$Model))) %>%
+  mutate(response_base = factor(response_base, levels = response_order),
+         daterange = factor(daterange, levels = daterange_order)) %>%
+  arrange(daterange, response_base)
+
+log_spatial_weighted_test_result <- spatial_weighted_test_result %>%
+  filter(lag == TRUE, coordinates == TRUE) %>%
+  mutate(transformation = if_else(str_detect(model_response_name, '_log'), 'Log', '')) %>%
+  filter(transformation == 'Log') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  arrange(factor(Model, levels = unique(spatial_weighted_test_result$Model))) %>%
+  mutate(response_base = factor(response_base, levels = response_order),
+         daterange = factor(daterange, levels = daterange_order)) %>%
+  arrange(daterange, response_base)
+
+top <- base_spatial_weighted_test_result %>%
+  # filter(Model %in% c('Exclude Event', 'Everything w.o Event Indicator')) %>% 
+  select('response_base', 'daterange', 'R2_mean', 'RMSE_mean')
+
+bottom <- log_spatial_weighted_test_result %>%
+  # filter(Model %in% c('Exclude Event', 'Everything w.o Event Indicator')) %>% 
+  select('response_base', 'daterange', 'R2_mean', 'RMSE_mean')
+
+spatial_weighted_result_table <- bind_rows(top,bottom) %>%
+  relocate('daterange') %>%
+  setNames(c("Time period", "Response",  c("R2", "RMSE")))
+
+spatial_result_table_kable <- spatial_result_table %>%
+  knitr::kable(format = 'latex', digits = 2) %>%
+  pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
+                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 2, 'Full' = 2))
+
+spatial_weighted_result_table %>%
+  knitr::kable(format = 'pipe', digits = 4, table.attr = "style='width:100%;'") %>%
+    pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
+                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 2, 'Full' = 2)) %>%
+  kable_styling()
+```
+
+## Temporal leave-one-out Test Result
+```{r}
+small_n_daily <- bind_rows(daily_ha_train, daily_ha_test) %>%
+  filter(year == 2021 & month %in% 7:8) %>% nrow()
+small_n_hourly <- bind_rows(hourly_train, hourly_test) %>%
+  filter(year == 2021 & month %in% 7:8) %>% nrow()
+
+
+base_temporal_test_result <- temporal_test_result %>%
+  mutate(transformation = if_else(str_detect(model_response_name, '_log'), 'Log', '')) %>%
+  filter(transformation == '') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  arrange(factor(Model, levels = unique(temporal_test_result$Model))) %>%
+  mutate(response_base = factor(response_base, levels = response_order),
+         daterange = factor(daterange, levels = daterange_order)) %>%
+  arrange(daterange, response_base)
+
+log_temporal_test_result <- temporal_test_result %>%
+  mutate(transformation = if_else(str_detect(model_response_name, '_log'), 'Log', '')) %>%
+  filter(transformation == 'Log') %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  arrange(factor(Model, levels = unique(spatial_test_result$Model))) %>%
+  mutate(response_base = factor(response_base, levels = response_order),
+         daterange = factor(daterange, levels = daterange_order)) %>%
+  arrange(daterange, response_base)
+
+top <- base_temporal_test_result %>%
+  # filter(Model %in% c('Exclude Event', 'Everything w.o Event Indicator')) %>% 
+  mutate(n = rep(c(small_n_daily,
+                   small_n_daily,
+                   small_n_hourly), times = 2)) %>%
+  select('response_base', 'daterange', 'n', 'R2', 'RMSE')
+
+bottom <- log_temporal_test_result %>%
+  # filter(Model %in% c('Exclude Event','Everything w.o Event Indicator')) %>% 
+  mutate(n = rep(c(small_n_daily,
+                   small_n_daily,
+                   small_n_hourly), times = 2)) %>%
+  relocate('n', .after = 'daterange') %>%
+  select('response_base', 'daterange', 'n', 'R2', 'RMSE')
+
+temporal_result_table <- bind_rows(top,bottom) %>%
+  relocate('daterange') %>%
+  setNames(c("Time period", "Response", "N", c("R2", "RMSE")))
+
+temporal_result_table_kable <- temporal_result_table %>%
+  knitr::kable(format = 'latex', digits = 2) %>%
+  pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
+                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 3, 'Small Event' = 2))
+
+writeLines(temporal_result_table_kable, '../figures/temporal_result_table_kable.tex')
+
+temporal_result_table %>%
+  knitr::kable(format = 'pipe', digits = 4, table.attr = "style='width:100%;'") %>%
+    pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
+                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 3, 'Small Event' = 2)) %>%
+  kable_styling()
+```
+
+## Number of negative predictions
+```{r}
+base_table <- base_table %>%
+  mutate(date_names = str_replace(date_names, 'Disaster', 'Event')) #%>%
+  # filter(date_names != 'Everything w. Event Indicator')
+
+full_negatives_table <- base_table %>%
+  select(all_of(c('date_names', 'model_response_name', 'n_test', 'negative_test'))) %>%
+  # left_join(negative_pred %>% filter(daterange != 'Everything w. Event Indicator'), 
+  #           join_by('date_names'=='Model', 'model_response_name')) %>%
+  left_join(negative_pred, 
+            join_by('date_names'=='Model', 'model_response_name')) %>%
+  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
+                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
+                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
+  select(-c('model_response_name', 'daterange')) %>%
+  select(all_of(c('response_base', 'n_test', 'negative_test', 'negative'))) %>%
+  mutate(negative_test = paste0(negative_test, ' (', round(negative_test/n_test*100, 2), '%)'),
+         negative = paste0(negative, ' (', round(negative/n_test*100, 2), '%)')) %>%
+  setNames(c('Response', 'N','Negatives', 'Negatives'))
+
+full_negatives_table_kable <- full_negatives_table %>%
+  knitr::kable(format = 'latex', digits = 2) %>%
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 2, 'GAM'=1, 'XGBoost'=1))
+
+writeLines(full_negatives_table_kable, '../figures/full_negatives_table_kable.tex')
+
+full_negatives_table %>%
+  knitr::kable(format = 'pipe', digits = 2) %>% 
+  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
+  add_header_above(c(' ' = 2, 'GAM'=1, 'XGBoost'=1))%>%
+  kable_styling()
+```
+
+# Additional stuffs {.tabset .tabset-pills}
+## Additional plots
+```{r}
+ggarrange(daha_log_excl_dis_ovp, 
+          dmha_log_excl_dis_subset_10_ovp +
+            theme(axis.title.y = element_blank()),
+          ha_log_excl_dis_subset_10_ovp+
+            theme(axis.title.y = element_blank()),
+          labels = c("a", "b", "c"), nrow = 1, ncol = 3)
+ggsave('../figures/obs_vs_pred_v22/excl_event_daha_dmha_ha_log_ovp.png', width = 30, height = 10, units = "cm")
+```
+
+```{r}
+ggarrange(daha_log_full_loeo_plot, 
+          dmha_log_full_loeo_plot +
+            theme(axis.title.y = element_blank()),
+          ha_log_full_loeo_plot+
+            theme(axis.title.y = element_blank()),
+          labels = c("a", "b", "c"), nrow = 1, ncol = 3)
+ggsave('../figures/loeo_plots/full_daha_dmha_ha_log_ovp.png', width = 30, height = 10, units = "cm")
+```
+
+```{r}
+ggarrange(daha_log_full_unstrat_ovp, 
+          daha_log_full_unstrat_subset_4_ovp,
+          dmha_log_full_unstrat_ovp,
+          dmha_log_full_unstrat_subset_10_ovp,
+          labels = c("a", "b", "c", "d"), nrow = 2, ncol = 2)
+ggsave('../figures/obs_vs_pred_v22/full_daha_dmha_log_ovp.png', width = 25, height = 25, units = "cm")
+```
+
+```{r}
+ggarrange(ha_log_full_unstrat_ovp, 
+          ha_log_full_unstrat_subset_10_ovp +
+            theme(axis.title.y = element_blank()),
+          labels = c("a", "b", "c"), nrow = 1, ncol = 2)
+ggsave('../figures/obs_vs_pred_v22/full_ha_log_ovp.png', width = 24, height = 10, units = "cm")
+```
+
+```{r}
+ggarrange(delete_layers(daha_log_full_unstrat_ovp, idx = 4), 
+          delete_layers(daha_log_full_unstrat_subset_4_ovp, idx = 4) +
+            theme(axis.title.y = element_blank()),
+          nrow = 1, ncol = 2)
+ggsave('../figures/obs_vs_pred_v22/full_daha_log_ovp.png', width = 20, height = 8, units = "cm")
+```
+
+## Feature importance
+```{r}
+# fi_a <- tibble(variable = c('month', 'year', 'weekday', 'wd_avg', 'ws_avg', 'hourly_downwind_ref',
+#        'dist_wrp', 'dist_ref', 'mon_utm_x', 'mon_utm_y', 'monthly_oil_2km',
+#        'monthly_gas_2km', 'active_2km', 'inactive_2km', 'hourly_downwind_wrp',
+#        'elevation', 'EVI', 'num_odor_complaints', 'dist_dc',
+#        'closest_wrp_capacity', 'hourly_temp', 'hourly_hum', 'hourly_precip'),
+#                importance = c(0.13021047, 0.07521281, 0.02970816, 0.03120303, 0.03475349,
+#        0.02487013, 0.10212769, 0.02596249, 0.03633532, 0.02554573,
+#        0.02889325, 0.0242726 , 0.02491183, 0.01805758, 0.01957374,
+#        0.08128748, 0.02610575, 0.04833119, 0.1154365 , 0.01783904,
+#        0.03367715, 0.02616808, 0.01951642)) %>%
+#       pivot_wider(names_from = variable,
+#                   values_from = importance) %>%
+#       rename(any_of(ha_names)) %>%
+#       pivot_longer(cols = everything(),names_to = 'variable', values_to = 'importance')
+# 
+# fi_a %>%
+#     top_n(15, importance) %>%
+#     ggplot(aes(x=reorder(variable, importance), y=importance)) +
+#     geom_point() +
+#     geom_segment(aes(x=variable,xend=variable,y=0,yend=importance)) +
+#     coord_flip() +
+#     theme_light() +
+#     theme(axis.text.y = element_text(size = 12),
+#           axis.title.x=element_blank(),
+#           axis.title.y=element_blank())
+# 
+ggsave(paste0(fi_folder, 'q99_ha_fi.png'), width = 20, height = 12, units = "cm")
+```
+
+```{r}
+fi1 + coord_cartesian(ylim = c(0, 0.125)) + coord_flip()
+```
+
+```{r}
+ggarrange(fi1 + coord_flip(ylim = c(0, 0.125)), 
+          fi2 + coord_flip(ylim = c(0, 0.125)), nrow = 2,
+          align = "v")
+ggsave('../figures/revisedfig4.png', width = 20, height = 20, units = "cm")
+```
+
+
+## Best params
+```{r}
+bestTune_df <- as_tibble(fit.xgb_daha_full_unstrat$bestTune) %>%
+  slice_head(n=0) %>%
+  mutate(date= character(),
+         response = character())
+response_names <- c("daha", "daha_log", "dmha", "dmha_log", "ha","ha_log"  )
+dateranges <- c("excl_dis", "full_unstrat")
+for (date in dateranges) {
+  for (response in response_names) {
+    model <- get(paste0('fit.xgb_', response, '_', date))
+    bestTune_df <- bestTune_df %>%
+      bind_rows(as_tibble(model$bestTune) %>% mutate(date = date, response = response))
+  }
+}
+bestTune_df<-bestTune_df %>% relocate(date, response)
+bestTune_df
+```
+
+
+
