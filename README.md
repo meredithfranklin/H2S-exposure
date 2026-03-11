@@ -14,6 +14,8 @@ We present high-resolution spatiotemporal modeling of hydrogen sulfide (H₂S) u
 
 We used 10-fold CV to hyperparamter tune, and three evaluation approaches: train-test split, leave-one-site-out (LOSO) and leave-one-event-out (LOEO) cross validation. 
 
+Model predictions can be explored with this [Shinyapp](https://jerrywu.shinyapps.io/Prediction_viz/)
+
 ---
 
 ## Data overview
