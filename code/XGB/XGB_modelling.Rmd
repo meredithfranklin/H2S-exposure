@@ -173,11 +173,7 @@ daily_ha_full_test <- daily_ha_test %>%
 ## Helpers and setup {.tabset .tabset-pills}
 ```{r}
 # Save path
-model_folder <- '../rfiles/xgboost_v41/' # For all models
-fi_folder <- '../figures/feature_importance_v22/'
-ovp_folder <- '../figures/obs_vs_pred_v22/'
-loso_folder <- '../figures/loso_plots/'
-loeo_folder <- '../figures/loeo_plots/'
+model_folder <- '../../models/XGB/' # For all models
 ```
 
 ```{r}
@@ -463,12 +459,12 @@ monitor_coord_map <- hourly_train %>% select(Monitor, mon_utm_x, mon_utm_y) %>% 
 
 ```{r}
 ######## Save some files for QXGB #######
-# write_parquet(monitor_coord_map, 'monitor_coord_map.parquet')
+# write_parquet(monitor_coord_map, '../../data/monitor_coord_map.parquet')
 # write_parquet(ha_full_full_for_q99_Xmat %>% as_tibble(), 
-#               '../rfiles/data/ha_full_full_for_py_v2.parquet')
+#               '../../data/ha_full_full_for_py_v2.parquet')
 # write_parquet(bind_rows(hourly_full_train %>% select(H2S_hourly_avg),
 #                         hourly_full_test %>% select(H2S_hourly_avg)),
-#               '../rfiles/data/ha_full_full_y_for_py_v2.parquet')
+#               '../../data/ha_full_full_y_for_py_v2.parquet')
 ############
 ```
 
@@ -1036,6 +1032,22 @@ fit_final_model <- function(model,
 ```
 
 ```{r}
+hourly_responses <- c('H2S_hourly_avg', 'log(H2S_hourly_avg)')
+daily_from_hour_avg_responses <- c('H2S_daily_avg_from_hourly_avg', 
+                                   'log(H2S_daily_avg_from_hourly_avg)',
+                                   'H2S_daily_max_from_hourly_avg', 
+                                   'log(H2S_daily_max_from_hourly_avg)')
+
+get_data <- function(response, daterange, type) {
+  if (response %in% hourly_responses) {
+      data <- get(paste0('hourly_', daterange, '_', type))
+  } else if (response %in% daily_from_hour_avg_responses) {
+      data <- get(paste0('daily_ha_', daterange, '_', type))
+  }
+  
+  return(data)
+}
+
 get_curr_data <- function(response = c('daha', 'dmha', 'ha',
                                        'daha_log', 'dmha_log', 'ha_log'), 
                           daterange = c('excl_dis', 'full_unstrat')){
@@ -1144,7 +1156,6 @@ new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v
 ```{r}
 # Feature importance of new model
 get_fi_plot(new_model, get_fi_names(response))
-ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -1162,7 +1173,6 @@ assign(paste(response, daterange, "ovp", sep = '_'),
        get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
                                        disaster_idx))
 get(paste(response, daterange, "ovp", sep = '_'))
-ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -1176,7 +1186,6 @@ if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
          get(paste(response, daterange, "ovp", sep = '_')) + 
            coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
   print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
-  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
 }
 ```
 
@@ -1201,8 +1210,8 @@ data <- bind_rows(daily_ha_excl_dis_train, daily_ha_excl_dis_test)
 lag_weight_max <- 1
 # spatial_cv <- spatial_validation(curr_model, data, 'Exclude Event',
 # response, daterange, lag = TRUE, weight_max = lag_weight_max)
-#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
-spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+#saveRDS(spatial_cv, paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
 spatial_cv$cv_table
 ```
 
@@ -1214,11 +1223,7 @@ for (i in seq_along(spatial_cv$cv_plots)) {
 
 ```{r, eval = TRUE}
 p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
-ggsave(
-  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
-  plot = p,
-  width = 15, height = 15, dpi = 300
-)
+p
 ```
 
 ```{r}
@@ -1277,8 +1282,8 @@ temporal_weight_max <- 1
 # temporal_test <- temporal_validation(curr_model, data, 'Exclude Event',
                                      # response, daterange, weight_max = temporal_weight_max)
 
-# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
-temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+# saveRDS(temporal_test, paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
 
 temporal_test_result <- temporal_test_result %>%
   add_row(temporal_test$result)
@@ -1288,7 +1293,6 @@ temporal_test$result
 
 ```{r}
 temporal_test$plot
-ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 
@@ -1312,7 +1316,6 @@ new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v
 ```{r}
 # Feature importance of new model
 get_fi_plot(new_model, get_fi_names(response))
-ggsave(paste0(fi_folder, daterange, '_', response,  '_wgt', v8020_weight_max, '_fi.png'), width = 20, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -1330,7 +1333,6 @@ assign(paste(response, daterange, "ovp", sep = '_'),
        get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
                                        disaster_idx))
 get(paste(response, daterange, "ovp", sep = '_'))
-ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -1344,7 +1346,6 @@ if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
          get(paste(response, daterange, "ovp", sep = '_')) + 
            coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
   print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
-  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
 }
 ```
 
@@ -1367,8 +1368,8 @@ negative_pred <- negative_pred %>%
 data <- bind_rows(daily_ha_full_train, daily_ha_full_test)
 # spatial_cv <- spatial_validation(curr_model, data, 'Everything w.o Event Indicator',
 # response, daterange, lag = TRUE, weight_max = lag_weight_max)
-#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
-spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+#saveRDS(spatial_cv, paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
 spatial_cv$cv_table
 ```
 
@@ -1380,11 +1381,7 @@ for (i in seq_along(spatial_cv$cv_plots)) {
 
 ```{r, eval = TRUE}
 p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
-ggsave(
-  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
-  plot = p,
-  width = 15, height = 15, dpi = 300
-)
+p
 ```
 
 ```{r}
@@ -1441,8 +1438,8 @@ spatial_weighted_avg_result
 # temporal_test <- temporal_validation(curr_model, data, 'Everything w.o Event Indicator',
                                      # response, daterange, weight_max = temporal_weight_max)
 
-# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
-temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+# saveRDS(temporal_test, paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
 
 temporal_test_result <- temporal_test_result %>%
   add_row(temporal_test$result)
@@ -1452,7 +1449,6 @@ temporal_test$result
 
 ```{r}
 temporal_test$plot
-ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ## Log DAHA {.tabset .tabset-pills}
@@ -1482,7 +1478,6 @@ new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v
 ```{r}
 # Feature importance of new model
 get_fi_plot(new_model, get_fi_names(response))
-ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -1500,7 +1495,6 @@ assign(paste(response, daterange, "ovp", sep = '_'),
        get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
                                        disaster_idx))
 get(paste(response, daterange, "ovp", sep = '_'))
-ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -1514,7 +1508,6 @@ if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
          get(paste(response, daterange, "ovp", sep = '_')) + 
            coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
   print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
-  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
 }
 ```
 
@@ -1538,8 +1531,8 @@ negative_pred <- negative_pred %>%
 data <- bind_rows(daily_ha_excl_dis_train, daily_ha_excl_dis_test)
 # spatial_cv <- spatial_validation(curr_model, data, 'Exclude Event',
 # response, daterange, lag = TRUE, weight_max = lag_weight_max)
-#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
-spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+#saveRDS(spatial_cv, paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
 spatial_cv$cv_table
 ```
 
@@ -1551,11 +1544,7 @@ for (i in seq_along(spatial_cv$cv_plots)) {
 
 ```{r, eval = TRUE}
 p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
-ggsave(
-  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
-  plot = p,
-  width = 15, height = 15, dpi = 300
-)
+p
 ```
 
 ```{r}
@@ -1612,8 +1601,8 @@ spatial_weighted_avg_result
 # temporal_test <- temporal_validation(curr_model, data, 'Exclude Event',
                                      # response, daterange, weight_max = temporal_weight_max)
 
-# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
-temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+# saveRDS(temporal_test, paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
 
 temporal_test_result <- temporal_test_result %>%
   add_row(temporal_test$result)
@@ -1623,7 +1612,6 @@ temporal_test$result
 
 ```{r}
 temporal_test$plot
-ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ### Everything w.o Disaster Indicator {.tabset .tabset-pills}
@@ -1647,8 +1635,6 @@ new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v
 ```{r}
 # Feature importance of new model
 get_fi_plot(new_model, get_fi_names(response))
-#fi1 <- get_fi_plot(new_model, get_fi_names(response))
-ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -1666,7 +1652,6 @@ assign(paste(response, daterange, "ovp", sep = '_'),
        get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
                                        disaster_idx))
 get(paste(response, daterange, "ovp", sep = '_'))
-ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -1680,7 +1665,6 @@ if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
          get(paste(response, daterange, "ovp", sep = '_')) + 
            coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
   print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
-  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
 }
 ```
 
@@ -1698,8 +1682,8 @@ test_result_unstrat <- test_result_unstrat %>%
 data <- bind_rows(daily_ha_full_train, daily_ha_full_test)
 # spatial_cv <- spatial_validation(curr_model, data, 'Everything w.o Event Indicator',
 # response, daterange, lag = TRUE, weight_max = lag_weight_max)
-#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
-spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+#saveRDS(spatial_cv, paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
 spatial_cv$cv_table
 ```
 
@@ -1711,11 +1695,7 @@ for (i in seq_along(spatial_cv$cv_plots)) {
 
 ```{r, eval = TRUE}
 p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
-ggsave(
-  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
-  plot = p,
-  width = 15, height = 15, dpi = 300
-)
+p
 ```
 
 ```{r}
@@ -1772,8 +1752,8 @@ spatial_weighted_avg_result
 # temporal_test <- temporal_validation(curr_model, data, 'Everything w.o Event Indicator',
                                      # response, daterange, weight_max = temporal_weight_max)
 
-# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
-temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+# saveRDS(temporal_test, paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
 
 temporal_test_result <- temporal_test_result %>%
   add_row(temporal_test$result)
@@ -1783,7 +1763,6 @@ temporal_test$result
 
 ```{r}
 temporal_test$plot
-ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -1797,14 +1776,14 @@ saveRDS(log_daha_full_xgb, paste0(model_folder, 'log_daha_full_final.rds'))
 ```
 
 ```{r}
-# Save the daily lags
-daily_lag <- data %>%
-  group_by(day) %>%
-  summarise(avg_da = mean(H2S_daily_avg_from_hourly_avg),
-            avg_dm = mean(H2S_daily_max_from_hourly_avg),
-            avg_log_da = mean(log(H2S_daily_avg_from_hourly_avg)),
-            avg_log_dm = mean(log(H2S_daily_max_from_hourly_avg)))
-saveRDS(daily_lag, '../rfiles/data/daily_lag.rds')
+# Save the daily lags for QXGB testing
+# daily_lag <- data %>%
+#   group_by(day) %>%
+#   summarise(avg_da = mean(H2S_daily_avg_from_hourly_avg),
+#             avg_dm = mean(H2S_daily_max_from_hourly_avg),
+#             avg_log_da = mean(log(H2S_daily_avg_from_hourly_avg)),
+#             avg_log_dm = mean(log(H2S_daily_max_from_hourly_avg)))
+# saveRDS(daily_lag, '../../data/daily_lag.rds')
 ```
 
 
@@ -1835,7 +1814,6 @@ new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v
 ```{r}
 # Feature importance of new model
 get_fi_plot(new_model, get_fi_names(response))
-ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -1853,7 +1831,6 @@ assign(paste(response, daterange, "ovp", sep = '_'),
        get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
                                        disaster_idx))
 get(paste(response, daterange, "ovp", sep = '_'))
-ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -1867,7 +1844,6 @@ if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
          get(paste(response, daterange, "ovp", sep = '_')) + 
            coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
   print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
-  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
 }
 ```
 
@@ -1890,8 +1866,8 @@ negative_pred <- negative_pred %>%
 data <- bind_rows(daily_ha_excl_dis_train, daily_ha_excl_dis_test)
 # spatial_cv <- spatial_validation(curr_model, data, 'Exclude Event',
 # response, daterange, lag = TRUE, weight_max = lag_weight_max)
-#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
-spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+#saveRDS(spatial_cv, paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
 spatial_cv$cv_table
 ```
 
@@ -1903,11 +1879,7 @@ for (i in seq_along(spatial_cv$cv_plots)) {
 
 ```{r, eval = TRUE}
 p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
-ggsave(
-  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
-  plot = p,
-  width = 15, height = 15, dpi = 300
-)
+p
 ```
 
 ```{r}
@@ -1964,8 +1936,8 @@ spatial_weighted_avg_result
 # temporal_test <- temporal_validation(curr_model, data, 'Exclude Event',
                                      # response, daterange, weight_max = temporal_weight_max)
 
-# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
-temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+# saveRDS(temporal_test, paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
 
 temporal_test_result <- temporal_test_result %>%
   add_row(temporal_test$result)
@@ -1975,7 +1947,6 @@ temporal_test$result
 
 ```{r}
 temporal_test$plot
-ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 
@@ -2000,7 +1971,6 @@ new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v
 ```{r}
 # Feature importance of new model
 get_fi_plot(new_model, get_fi_names(response))
-ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -2018,7 +1988,6 @@ assign(paste(response, daterange, "ovp", sep = '_'),
        get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
                                        disaster_idx))
 get(paste(response, daterange, "ovp", sep = '_'))
-ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -2032,7 +2001,6 @@ if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
          get(paste(response, daterange, "ovp", sep = '_')) + 
            coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
   print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
-  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
 }
 ```
 
@@ -2056,8 +2024,8 @@ negative_pred <- negative_pred %>%
 data <- bind_rows(daily_ha_full_train, daily_ha_full_test)
 # spatial_cv <- spatial_validation(curr_model, data, 'Everything w.o Event Indicator',
 # response, daterange, lag = TRUE, weight_max = lag_weight_max)
-#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
-spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+#saveRDS(spatial_cv, paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
 spatial_cv$cv_table
 ```
 
@@ -2069,11 +2037,7 @@ for (i in seq_along(spatial_cv$cv_plots)) {
 
 ```{r, eval = TRUE}
 p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
-ggsave(
-  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
-  plot = p,
-  width = 15, height = 15, dpi = 300
-)
+p
 ```
 
 ```{r}
@@ -2130,8 +2094,8 @@ spatial_weighted_avg_result
 # temporal_test <- temporal_validation(curr_model, data, 'Everything w.o Event Indicator',
                                      # response, daterange, weight_max = temporal_weight_max)
 
-# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
-temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+# saveRDS(temporal_test, paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
 
 temporal_test_result <- temporal_test_result %>%
   add_row(temporal_test$result)
@@ -2141,7 +2105,6 @@ temporal_test$result
 
 ```{r}
 temporal_test$plot
-ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ## Log DMHA {.tabset .tabset-pills}
@@ -2171,7 +2134,6 @@ new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v
 ```{r}
 # Feature importance of new model
 get_fi_plot(new_model, get_fi_names(response))
-ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -2189,7 +2151,6 @@ assign(paste(response, daterange, "ovp", sep = '_'),
        get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
                                        disaster_idx))
 get(paste(response, daterange, "ovp", sep = '_'))
-ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -2203,7 +2164,6 @@ if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
          get(paste(response, daterange, "ovp", sep = '_')) + 
            coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
   print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
-  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
 }
 ```
 
@@ -2221,8 +2181,8 @@ test_result <- test_result %>%
 data <- bind_rows(daily_ha_excl_dis_train, daily_ha_excl_dis_test)
 # spatial_cv <- spatial_validation(curr_model, data, 'Exclude Event',
 # response, daterange, lag = TRUE, weight_max = lag_weight_max)
-#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
-spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+#saveRDS(spatial_cv, paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
 spatial_cv$cv_table
 ```
 
@@ -2234,11 +2194,7 @@ for (i in seq_along(spatial_cv$cv_plots)) {
 
 ```{r, eval = TRUE}
 p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
-ggsave(
-  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
-  plot = p,
-  width = 15, height = 15, dpi = 300
-)
+p
 ```
 
 ```{r}
@@ -2295,8 +2251,8 @@ spatial_weighted_avg_result
 # temporal_test <- temporal_validation(curr_model, data, 'Exclude Event',
                                      # response, daterange, weight_max = temporal_weight_max)
 
-# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
-temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+# saveRDS(temporal_test, paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
 
 temporal_test_result <- temporal_test_result %>%
   add_row(temporal_test$result)
@@ -2306,7 +2262,6 @@ temporal_test$result
 
 ```{r}
 temporal_test$plot
-ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ### Everything w.o Disaster Indicator {.tabset .tabset-pills}
@@ -2330,8 +2285,6 @@ new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v
 ```{r}
 # Feature importance of new model
 get_fi_plot(new_model, get_fi_names(response))
-# fi2 <-get_fi_plot(new_model, get_fi_names(response))
-ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -2349,7 +2302,6 @@ assign(paste(response, daterange, "ovp", sep = '_'),
        get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
                                        disaster_idx))
 get(paste(response, daterange, "ovp", sep = '_'))
-ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -2363,7 +2315,6 @@ if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
          get(paste(response, daterange, "ovp", sep = '_')) + 
            coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
   print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
-  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
 }
 ```
 
@@ -2380,8 +2331,8 @@ test_result_unstrat <- test_result_unstrat %>%
 data <- bind_rows(daily_ha_full_train, daily_ha_full_test)
 # spatial_cv <- spatial_validation(curr_model, data, 'Everything w.o Event Indicator',
 # response, daterange, lag = TRUE, weight_max = lag_weight_max)
-#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
-spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+#saveRDS(spatial_cv, paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
 spatial_cv$cv_table
 ```
 
@@ -2393,11 +2344,7 @@ for (i in seq_along(spatial_cv$cv_plots)) {
 
 ```{r, eval = TRUE}
 p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
-ggsave(
-  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
-  plot = p,
-  width = 15, height = 15, dpi = 300
-)
+p
 ```
 
 ```{r}
@@ -2454,8 +2401,8 @@ spatial_weighted_avg_result
 # temporal_test <- temporal_validation(curr_model, data, 'Everything w.o Event Indicator',
                                      # response, daterange, weight_max = temporal_weight_max)
 
-# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
-temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+# saveRDS(temporal_test, paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
 
 temporal_test_result <- temporal_test_result %>%
   add_row(temporal_test$result)
@@ -2465,7 +2412,6 @@ temporal_test$result
 
 ```{r}
 temporal_test$plot
-ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -2506,7 +2452,6 @@ new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v
 ```{r}
 # Feature importance of new model
 get_fi_plot(new_model, get_fi_names(response))
-ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -2524,7 +2469,6 @@ assign(paste(response, daterange, "ovp", sep = '_'),
        get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
                                        disaster_idx))
 get(paste(response, daterange, "ovp", sep = '_'))
-ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -2538,7 +2482,6 @@ if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
          get(paste(response, daterange, "ovp", sep = '_')) + 
            coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
   print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
-  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
 }
 ```
 
@@ -2561,8 +2504,8 @@ negative_pred <- negative_pred %>%
 data <- bind_rows(hourly_excl_dis_train, hourly_excl_dis_test)
 # spatial_cv <- spatial_validation(curr_model, data, 'Exclude Event',
 # response, daterange, lag = TRUE, weight_max = lag_weight_max)
-#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
-spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+#saveRDS(spatial_cv, paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
 spatial_cv$cv_table
 ```
 
@@ -2574,11 +2517,7 @@ for (i in seq_along(spatial_cv$cv_plots)) {
 
 ```{r, eval = TRUE}
 p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
-ggsave(
-  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
-  plot = p,
-  width = 15, height = 15, dpi = 300
-)
+p
 ```
 
 ```{r}
@@ -2635,8 +2574,8 @@ spatial_weighted_avg_result
 # temporal_test <- temporal_validation(curr_model, data, 'Exclude Event',
                                      # response, daterange, weight_max = temporal_weight_max)
 
-# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
-temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+# saveRDS(temporal_test, paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
 
 temporal_test_result <- temporal_test_result %>%
   add_row(temporal_test$result)
@@ -2646,7 +2585,6 @@ temporal_test$result
 
 ```{r}
 temporal_test$plot
-ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ### Everything w.o Disaster Indicator {.tabset .tabset-pills}
@@ -2670,7 +2608,6 @@ new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v
 ```{r}
 # Feature importance of new model
 get_fi_plot(new_model, get_fi_names(response))
-ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -2688,7 +2625,6 @@ assign(paste(response, daterange, "ovp", sep = '_'),
        get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
                                        disaster_idx))
 get(paste(response, daterange, "ovp", sep = '_'))
-ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -2702,7 +2638,6 @@ if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
          get(paste(response, daterange, "ovp", sep = '_')) + 
            coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
   print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
-  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
 }
 ```
 
@@ -2725,8 +2660,8 @@ negative_pred <- negative_pred %>%
 data <- bind_rows(hourly_full_train, hourly_full_test)
 # spatial_cv <- spatial_validation(curr_model, data, 'Everything w.o Event Indicator',
 # response, daterange, lag = TRUE, weight_max = lag_weight_max)
-#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
-spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+#saveRDS(spatial_cv, paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
 spatial_cv$cv_table
 ```
 
@@ -2738,11 +2673,7 @@ for (i in seq_along(spatial_cv$cv_plots)) {
 
 ```{r, eval = TRUE}
 p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
-ggsave(
-  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
-  plot = p,
-  width = 15, height = 15, dpi = 300
-)
+p
 ```
 
 ```{r}
@@ -2799,8 +2730,8 @@ spatial_weighted_avg_result
 # temporal_test <- temporal_validation(curr_model, data, 'Everything w.o Event Indicator',
                                      # response, daterange, weight_max = temporal_weight_max)
 
-# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
-temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+# saveRDS(temporal_test, paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
 
 temporal_test_result <- temporal_test_result %>%
   add_row(temporal_test$result)
@@ -2810,7 +2741,6 @@ temporal_test$result
 
 ```{r}
 temporal_test$plot
-ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ## Log HA {.tabset .tabset-pills}
@@ -2840,7 +2770,6 @@ new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v
 ```{r}
 # Feature importance of new model
 get_fi_plot(new_model, get_fi_names(response))
-ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -2858,7 +2787,6 @@ assign(paste(response, daterange, "ovp", sep = '_'),
        get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
                                        disaster_idx))
 get(paste(response, daterange, "ovp", sep = '_'))
-ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -2872,7 +2800,6 @@ if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
          get(paste(response, daterange, "ovp", sep = '_')) + 
            coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
   print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
-  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
 }
 ```
 
@@ -2889,8 +2816,8 @@ test_result <- test_result %>%
 data <- bind_rows(hourly_excl_dis_train, hourly_excl_dis_test)
 # spatial_cv <- spatial_validation(curr_model, data, 'Exclude Event',
 # response, daterange, lag = TRUE, weight_max = lag_weight_max)
-#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
-spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+#saveRDS(spatial_cv, paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
 spatial_cv$cv_table
 ```
 
@@ -2902,11 +2829,7 @@ for (i in seq_along(spatial_cv$cv_plots)) {
 
 ```{r, eval = TRUE}
 p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
-ggsave(
-  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
-  plot = p,
-  width = 15, height = 15, dpi = 300
-)
+p
 ```
 
 ```{r}
@@ -2963,8 +2886,8 @@ spatial_weighted_avg_result
 # temporal_test <- temporal_validation(curr_model, data, 'Exclude Event',
                                      # response, daterange, weight_max = temporal_weight_max)
 
-# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
-temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+# saveRDS(temporal_test, paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
 
 temporal_test_result <- temporal_test_result %>%
   add_row(temporal_test$result)
@@ -2974,7 +2897,6 @@ temporal_test$result
 
 ```{r}
 temporal_test$plot
-ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ### Everything w.o Disaster Indicator {.tabset .tabset-pills}
@@ -2998,7 +2920,6 @@ new_model <- fit_new_8020(curr_model, curr_X_train, curr_y_train, weight_max = v
 ```{r}
 # Feature importance of new model
 get_fi_plot(new_model, get_fi_names(response))
-ggsave(paste0(fi_folder, daterange, '_', response, '_fi.png'), width = 20, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -3016,7 +2937,6 @@ assign(paste(response, daterange, "ovp", sep = '_'),
        get_ovp_plot(curr_y_test, test_pred, BT = transformation == 'log',
                                        disaster_idx))
 get(paste(response, daterange, "ovp", sep = '_'))
-ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, '_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -3030,7 +2950,6 @@ if (daterange == 'full_unstrat' | !(response  %in% c('daha', 'daha_log'))) {
          get(paste(response, daterange, "ovp", sep = '_')) + 
            coord_cartesian(xlim = c(0, lim), ylim = c(0, lim)))
   print(get(paste(response, daterange, "subset", lim, "ovp", sep = '_')))
-  ggsave(paste0(ovp_folder, response, '_', daterange,  '_wgt', v8020_weight_max, 'subset', lim, '_ovp.png'), width = 16, height = 12, units = "cm")
 }
 ```
 
@@ -3046,8 +2965,8 @@ test_result_unstrat <- test_result_unstrat %>%
 data <- bind_rows(hourly_full_train, hourly_full_test)
 # spatial_cv <- spatial_validation(curr_model, data, 'Everything w.o Event Indicator',
 # response, daterange, lag = TRUE, weight_max = lag_weight_max)
-#saveRDS(spatial_cv, paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
-spatial_cv <- readRDS(paste0('../rfiles/spatial_tests_v2/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+#saveRDS(spatial_cv, paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
+spatial_cv <- readRDS(paste0('../../tests/spatial_test/spatial_test_wlag', response, '_', daterange,  '_wgt', lag_weight_max, '.rds'))
 spatial_cv$cv_table
 ```
 
@@ -3059,11 +2978,7 @@ for (i in seq_along(spatial_cv$cv_plots)) {
 
 ```{r, eval = TRUE}
 p<-wrap_plots(spatial_cv$cv_plots[1:14], ncol = 3)
-ggsave(
-  filename = file.path(paste0(loso_folder, daterange, '_', response,  '_wgt', lag_weight_max, '_loso_wlag_all_ovp.png')),
-  plot = p,
-  width = 15, height = 15, dpi = 300
-)
+p
 ```
 
 ```{r}
@@ -3121,8 +3036,8 @@ spatial_weighted_avg_result
 # temporal_test <- temporal_validation(curr_model, data, 'Everything w.o Event Indicator',
                                      # response, daterange, weight_max = temporal_weight_max)
 
-# saveRDS(temporal_test, paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
-temporal_test <- readRDS(paste0('../rfiles/temporal_tests_v2/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+# saveRDS(temporal_test, paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
+temporal_test <- readRDS(paste0('../../tests/temporal_test/temporal_test_', response, '_', daterange, '_wgt', temporal_weight_max,'.rds'))
 
 temporal_test_result <- temporal_test_result %>%
   add_row(temporal_test$result)
@@ -3132,7 +3047,6 @@ temporal_test$result
 
 ```{r}
 temporal_test$plot
-ggsave(paste0(loeo_folder, response, '_', daterange,  '_wgt', temporal_weight_max, 'loeo_ovp.png'), width = 16, height = 12, units = "cm")
 ```
 
 ```{r}
@@ -3214,15 +3128,6 @@ xgb_result_table <- bind_rows(top,bottom) %>%
   relocate('daterange') %>%
   setNames(c("Time period", "Response", "N", rep(c("R2", "RMSE"), 3)))
 
-full_result_table_kable <- xgb_result_table %>%
-  knitr::kable(format = 'latex', digits = 2) %>%
-  pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
-  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
-                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
-  add_header_above(c(' ' = 3, 'Full' = 2, 'Event' = 2, 'Routine' = 2))
-
-writeLines(full_result_table_kable, '../figures/full_result_table_kable.tex')
-
 xgb_result_table %>%
   knitr::kable(format = 'pipe', digits = 4, table.attr = "style='width:100%;'") %>%
     pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
@@ -3275,15 +3180,6 @@ bottom <- log_spatial_test_result %>%
 spatial_result_table <- bind_rows(top,bottom) %>%
   relocate('daterange') %>%
   setNames(c("Time period", "Response",  rep(c("R2", "RMSE"), 3)))
-
-spatial_result_table_kable <- spatial_result_table %>%
-  knitr::kable(format = 'latex', digits = 2) %>%
-  pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
-  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
-                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
-  add_header_above(c(' ' = 2, 'Full' = 2, 'Event' = 2, 'Routine' = 2))
-
-# writeLines(spatial_result_table_kable, '../figures/spatial_result_table_kable.tex')
 
 spatial_result_table %>%
   knitr::kable(format = 'pipe', digits = 4, table.attr = "style='width:100%;'") %>%
@@ -3531,14 +3427,6 @@ temporal_result_table <- bind_rows(top,bottom) %>%
   relocate('daterange') %>%
   setNames(c("Time period", "Response", "N", c("R2", "RMSE")))
 
-temporal_result_table_kable <- temporal_result_table %>%
-  knitr::kable(format = 'latex', digits = 2) %>%
-  pack_rows(index = c("No Transformation" = 6, "Log Transformation" = 6)) %>%
-  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3, 
-                      "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
-  add_header_above(c(' ' = 3, 'Small Event' = 2))
-
-writeLines(temporal_result_table_kable, '../figures/temporal_result_table_kable.tex')
 
 temporal_result_table %>%
   knitr::kable(format = 'pipe', digits = 4, table.attr = "style='width:100%;'") %>%
@@ -3547,130 +3435,6 @@ temporal_result_table %>%
                       "Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
   add_header_above(c(' ' = 3, 'Small Event' = 2)) %>%
   kable_styling()
-```
-
-## Number of negative predictions
-```{r}
-base_table <- base_table %>%
-  mutate(date_names = str_replace(date_names, 'Disaster', 'Event')) #%>%
-  # filter(date_names != 'Everything w. Event Indicator')
-
-full_negatives_table <- base_table %>%
-  select(all_of(c('date_names', 'model_response_name', 'n_test', 'negative_test'))) %>%
-  # left_join(negative_pred %>% filter(daterange != 'Everything w. Event Indicator'), 
-  #           join_by('date_names'=='Model', 'model_response_name')) %>%
-  left_join(negative_pred, 
-            join_by('date_names'=='Model', 'model_response_name')) %>%
-  mutate(response_base = case_when(str_detect(model_response_name, 'daha') ~ 'Daily Avg From Hourly Avg',
-                                   str_detect(model_response_name, 'dmha') ~ 'Daily Max From Hourly Avg',
-                                   str_detect(model_response_name, 'ha') ~ 'Hourly Avg')) %>%
-  select(-c('model_response_name', 'daterange')) %>%
-  select(all_of(c('response_base', 'n_test', 'negative_test', 'negative'))) %>%
-  mutate(negative_test = paste0(negative_test, ' (', round(negative_test/n_test*100, 2), '%)'),
-         negative = paste0(negative, ' (', round(negative/n_test*100, 2), '%)')) %>%
-  setNames(c('Response', 'N','Negatives', 'Negatives'))
-
-full_negatives_table_kable <- full_negatives_table %>%
-  knitr::kable(format = 'latex', digits = 2) %>%
-  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
-  add_header_above(c(' ' = 2, 'GAM'=1, 'XGBoost'=1))
-
-writeLines(full_negatives_table_kable, '../figures/full_negatives_table_kable.tex')
-
-full_negatives_table %>%
-  knitr::kable(format = 'pipe', digits = 2) %>% 
-  pack_rows(index = c("Exclude Event" = 3, "Everything w.o D.I" = 3)) %>%
-  add_header_above(c(' ' = 2, 'GAM'=1, 'XGBoost'=1))%>%
-  kable_styling()
-```
-
-# Additional stuffs {.tabset .tabset-pills}
-## Additional plots
-```{r}
-ggarrange(daha_log_excl_dis_ovp, 
-          dmha_log_excl_dis_subset_10_ovp +
-            theme(axis.title.y = element_blank()),
-          ha_log_excl_dis_subset_10_ovp+
-            theme(axis.title.y = element_blank()),
-          labels = c("a", "b", "c"), nrow = 1, ncol = 3)
-ggsave('../figures/obs_vs_pred_v22/excl_event_daha_dmha_ha_log_ovp.png', width = 30, height = 10, units = "cm")
-```
-
-```{r}
-ggarrange(daha_log_full_loeo_plot, 
-          dmha_log_full_loeo_plot +
-            theme(axis.title.y = element_blank()),
-          ha_log_full_loeo_plot+
-            theme(axis.title.y = element_blank()),
-          labels = c("a", "b", "c"), nrow = 1, ncol = 3)
-ggsave('../figures/loeo_plots/full_daha_dmha_ha_log_ovp.png', width = 30, height = 10, units = "cm")
-```
-
-```{r}
-ggarrange(daha_log_full_unstrat_ovp, 
-          daha_log_full_unstrat_subset_4_ovp,
-          dmha_log_full_unstrat_ovp,
-          dmha_log_full_unstrat_subset_10_ovp,
-          labels = c("a", "b", "c", "d"), nrow = 2, ncol = 2)
-ggsave('../figures/obs_vs_pred_v22/full_daha_dmha_log_ovp.png', width = 25, height = 25, units = "cm")
-```
-
-```{r}
-ggarrange(ha_log_full_unstrat_ovp, 
-          ha_log_full_unstrat_subset_10_ovp +
-            theme(axis.title.y = element_blank()),
-          labels = c("a", "b", "c"), nrow = 1, ncol = 2)
-ggsave('../figures/obs_vs_pred_v22/full_ha_log_ovp.png', width = 24, height = 10, units = "cm")
-```
-
-```{r}
-ggarrange(delete_layers(daha_log_full_unstrat_ovp, idx = 4), 
-          delete_layers(daha_log_full_unstrat_subset_4_ovp, idx = 4) +
-            theme(axis.title.y = element_blank()),
-          nrow = 1, ncol = 2)
-ggsave('../figures/obs_vs_pred_v22/full_daha_log_ovp.png', width = 20, height = 8, units = "cm")
-```
-
-## Feature importance
-```{r}
-# fi_a <- tibble(variable = c('month', 'year', 'weekday', 'wd_avg', 'ws_avg', 'hourly_downwind_ref',
-#        'dist_wrp', 'dist_ref', 'mon_utm_x', 'mon_utm_y', 'monthly_oil_2km',
-#        'monthly_gas_2km', 'active_2km', 'inactive_2km', 'hourly_downwind_wrp',
-#        'elevation', 'EVI', 'num_odor_complaints', 'dist_dc',
-#        'closest_wrp_capacity', 'hourly_temp', 'hourly_hum', 'hourly_precip'),
-#                importance = c(0.13021047, 0.07521281, 0.02970816, 0.03120303, 0.03475349,
-#        0.02487013, 0.10212769, 0.02596249, 0.03633532, 0.02554573,
-#        0.02889325, 0.0242726 , 0.02491183, 0.01805758, 0.01957374,
-#        0.08128748, 0.02610575, 0.04833119, 0.1154365 , 0.01783904,
-#        0.03367715, 0.02616808, 0.01951642)) %>%
-#       pivot_wider(names_from = variable,
-#                   values_from = importance) %>%
-#       rename(any_of(ha_names)) %>%
-#       pivot_longer(cols = everything(),names_to = 'variable', values_to = 'importance')
-# 
-# fi_a %>%
-#     top_n(15, importance) %>%
-#     ggplot(aes(x=reorder(variable, importance), y=importance)) +
-#     geom_point() +
-#     geom_segment(aes(x=variable,xend=variable,y=0,yend=importance)) +
-#     coord_flip() +
-#     theme_light() +
-#     theme(axis.text.y = element_text(size = 12),
-#           axis.title.x=element_blank(),
-#           axis.title.y=element_blank())
-# 
-ggsave(paste0(fi_folder, 'q99_ha_fi.png'), width = 20, height = 12, units = "cm")
-```
-
-```{r}
-fi1 + coord_cartesian(ylim = c(0, 0.125)) + coord_flip()
-```
-
-```{r}
-ggarrange(fi1 + coord_flip(ylim = c(0, 0.125)), 
-          fi2 + coord_flip(ylim = c(0, 0.125)), nrow = 2,
-          align = "v")
-ggsave('../figures/revisedfig4.png', width = 20, height = 20, units = "cm")
 ```
 
 

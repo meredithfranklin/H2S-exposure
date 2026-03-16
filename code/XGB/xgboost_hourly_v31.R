@@ -14,7 +14,7 @@ select <- dplyr::select
 #n_cores <- detectCores(); n_cores
 #registerDoParallel(cores = 8)
 
-hourly_train <- readRDS('../rfiles/data/hourly_train.rds')
+hourly_train <- readRDS('../../data/hourly_train.rds')
 
 predictors <- c('month', 'year', 'weekday', 'julian', 'wd_avg', 'ws_avg', 
                 'hourly_downwind_ref', 'dist_wrp', 'dist_ref',
@@ -22,7 +22,7 @@ predictors <- c('month', 'year', 'weekday', 'julian', 'wd_avg', 'ws_avg',
                 'active_2km', 'inactive_2km', 'hourly_downwind_wrp', 'elevation', 'EVI', 'num_odor_complaints',
                 'dist_dc', 'closest_wrp_capacity', 'hourly_temp', 'hourly_hum', 'hourly_precip') 
 
-savedir <- '../rfiles/xgboost_v41/'
+savedir <- '../../models/XGB/'
 ############### Hourly Avg ###################
 tune_grid <- expand.grid(nrounds = c(50, 100, 150),
                          max_depth = c(4, 5, 6),

@@ -8,8 +8,8 @@ library(caret)
 library(fastDummies)
 select <- dplyr::select
 
-savedir <- '../rfiles/xgboost_v41/'
-daily_ha_train <- readRDS('../rfiles/data/daily_ha_train.rds')
+savedir <- '../../models/XGB/'
+daily_ha_train <- readRDS('../../data/daily_ha_train.rds')
 
 da_predictors <- c('month', 'year', 'weekday', 'daily_wd', 'daily_ws', 
                 'daily_downwind_ref', 'dist_wrp', 'dist_ref',

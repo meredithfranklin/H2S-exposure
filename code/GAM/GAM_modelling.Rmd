@@ -759,3 +759,4 @@ gam_result_table %>%
   add_header_above(c(' ' = 3, 'Full' = 2, 'Event' = 2, 'Routine' = 2)) %>%
   kable_styling()
 ```
+
